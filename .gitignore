@@ -8,3 +8,6 @@ notes.txt
 /lnp_activations_bank*
 /full_video_activations
 /reconstructions
+
+/frame_features*.csv
+/random_sk.py

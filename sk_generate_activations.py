@@ -1,13 +1,13 @@
 import os
 import argparse
 import random
-import torch
 import numpy as np
+import torch
 import h5py
 import json
 import scipy.ndimage
 from sk_utils import Utils as u
-from sk_models import Retina
+from sk_retina_encoders import Retina
 
 from tqdm import tqdm
 

@@ -118,6 +118,75 @@ OFF_Midget:
     beta: 1
     gamma: 0
     type: soft-rectifier
+ON_Smooth_Monostratified:
+  cell_type: ON_Smooth_Monostratified
+  max_firing_rate: 700
+  n_hotspots: 7
+  n_subunits: 4
+  hotspot_grouping: [[0], [1, 4, 5], [6], [2, 3]]
+  spatial:
+    width: 85
+    height: 85
+    hotspot_ring_radius: 25
+    hotspot_sigma: 7.5
+    hotspot_jitter: 5.0
+    center_size: 25
+  temporal:
+    # per-subunit temporal filters — each subunit has distinct dynamics
+    # subunit 0: fast, sharp transient
+    subunit_0:
+      memory_ms: 250
+      amp1: 0.6
+      amp2: 0.3
+      peak1_ms: 25
+      peak2_ms: 50
+      width1_ms: 15
+      width2_ms: 30
+    # subunit 1: intermediate, slightly delayed
+    subunit_1:
+      memory_ms: 250
+      amp1: 0.5
+      amp2: 0.2
+      peak1_ms: 35
+      peak2_ms: 65
+      width1_ms: 20
+      width2_ms: 40
+    # subunit 2: slowest, most sustained
+    subunit_2:
+      memory_ms: 250
+      amp1: 0.4
+      amp2: 0.1
+      peak1_ms: 45
+      peak2_ms: 85
+      width1_ms: 25
+      width2_ms: 50
+    # subunit 3: intermediate, similar to subunit 1 but slightly different
+    subunit_3:
+      memory_ms: 250
+      amp1: 0.5
+      amp2: 0.25
+      peak1_ms: 30
+      peak2_ms: 60
+      width1_ms: 18
+      width2_ms: 35
+  tiling_config:
+    n_cells: None
+    rf_diameter: 85
+    base_spacing: 6.0
+    offset: [0, 0]
+    coverage_factor: 1.0
+    selection_method: center_first
+  nonlinearity:
+    alpha: 1
+    beta: 2
+    gamma: 0
+    type: soft-rectifier
+  subunit_nonlinearity:
+    alpha: 1
+    beta: 2
+    gamma: 0
+    type: soft-rectifier
+
 
 video_parameters:
   frame_shape: [128, 128]

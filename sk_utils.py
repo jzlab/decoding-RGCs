@@ -162,3 +162,90 @@ class Utils:
 
         print("\nMigration complete. Reclaim space with 'h5repack' if desired.")
 
+    @staticmethod
+    def reconstruct_batch(folder_path, weights_path, params_path="params.yaml", training_params_path="params_training.yaml", device=None):
+        """
+        Runs sk_reconstruct_video.py on all videos in a folder.
+        For each video, it runs:
+        1. Full reconstruction (all 4 cell types)
+        2. Masked reconstructions (only 1 cell type active at a time)
+        
+        Args:
+            folder_path (str): Path to folder containing .mp4 or .avi videos.
+            weights_path (str): Path to the decoder weights file (.pt).
+            params_path (str): Path to the params.yaml file.
+            training_params_path (str): Path to the training params file.
+            device (str): 'cuda' or 'cpu'. Defaults to auto-detect.
+        """
+        import subprocess
+        import glob
+        import os
+        import sys
+
+        # Find videos
+        extensions = ['*.mp4', '*.avi', '*.mov']
+        video_files = []
+        for ext in extensions:
+            video_files.extend(glob.glob(os.path.join(folder_path, ext)))
+        
+        if not video_files:
+            print(f"No videos found in {folder_path}")
+            return
+
+        print(f"Found {len(video_files)} videos. Starting batch reconstruction...")
+        
+        python_exec = sys.executable
+        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        
+        for video in video_files:
+            basename = os.path.splitext(os.path.basename(video))[0]
+            # Create a dedicated activations file for this video in its current folder
+            act_path = os.path.join(folder_path, f"{basename}_activations.pt")
+            
+            # Setup environment to avoid MKL threading issues
+            env = os.environ.copy()
+            env["MKL_THREADING_LAYER"] = "GNU"
+
+            # --- 1. Full Reconstruction ---
+            out_all = os.path.join(folder_path, f"{basename}_reconstructed_all.mp4")
+            print(f"\n[Batch] Processing {basename}: FULL reconstruction...")
+            cmd_all = [
+                python_exec, "sk_reconstruct_video.py",
+                "--video", video,
+                "--weights", weights_path,
+                "--params", params_path,
+                "--training-params", training_params_path,
+                "--output-activations", act_path,
+                "--output-video", out_all,
+                "--device", device
+            ]
+            subprocess.run(cmd_all, check=True, env=env)
+            
+            # --- 2. Masked Reconstructions (One cell type at a time) ---
+            # There are 4 cell types: 0, 1, 2, 3
+            celltypes = {
+                "0": "ONParasol",
+                "1": "OFFParasol",
+                "2": "ONMidget",
+                "3": "OFFMidget"
+            }
+            for i in range(4):
+                # zero out everything EXCEPT cell type i
+                zeros = [str(j) for j in range(4) if j != i]
+                out_masked = os.path.join(folder_path, f"{basename}_reconstructed_{celltypes[str(i)]}.mp4")
+                
+                print(f"\n[Batch] Processing {basename}: ONLY {celltypes[str(i)]}...")
+                cmd_masked = [
+                    python_exec, "sk_reconstruct_video.py",
+                    "--video", video,
+                    "--weights", weights_path,
+                    "--params", params_path,
+                    "--training-params", training_params_path,
+                    "--activations", act_path,  # Load the activations we just generated
+                    "--output-video", out_masked,
+                    "--device", device,
+                    "--zero-celltype"
+                ] + zeros
+                subprocess.run(cmd_masked, check=True, env=env)
+            
+            print(f"\n[Batch] Finished {basename}.")

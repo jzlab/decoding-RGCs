@@ -1,7 +1,7 @@
 import os
 import argparse
-import torch
 import numpy as np
+import torch
 import cv2
 import subprocess
 import h5py
@@ -9,6 +9,7 @@ from tqdm import tqdm
 
 from sk_utils import Utils as u
 from sk_decoder import RetinaDecoder
+from sk_generate_activations import setup_retina, crop_video
 
 def setup_decoder(params, training_params, n_cells_per_mosaic, device="cpu", weights_path=None):
     print("Initializing Decoder model...")
@@ -88,12 +89,19 @@ def main():
     video_params = params.get("video_parameters", {})
     patch_h, patch_w = video_params.get("frame_shape", [128, 128])
     
-    print(f"Loading baseline video info from {args.video}...")
-    # Just need dimensions, so we fetch it quickly
-    _, props = u.read_video(args.video)
-    fps, H_full, W_full, T = props["fps"], int(props["height"]), int(props["width"]), int(props["total_frames"])
+    print(f"Loading baseline video info from {args.video} (first 5000 frames)...")
+    # Stream the first 5000 frames to avoid loading massive videos into RAM
+    video_gen, props = u.read_video(args.video, stream=True, chunk_frames=5000)
+    try:
+        first_chunk = next(video_gen)
+    except StopIteration:
+        print("Error: Video is empty!")
+        return
+
+    fps, H_full, W_full = props["fps"], int(props["height"]), int(props["width"])
+    T = first_chunk.shape[0]
     
-    print(f"Original video: {T} frames, {H_full}x{W_full} resolution at {fps} FPS.")
+    print(f"Original video: {props['total_frames']} frames total. Processing first {T} frames, {H_full}x{W_full} resolution at {fps} FPS.")
     
     H_pad, W_pad = pad_dimensions(H_full, W_full, patch_h, patch_w)
     print(f"Padded canvas target: {T} frames, {H_pad}x{W_pad}.")
@@ -110,54 +118,30 @@ def main():
         data = torch.load(args.activations, map_location="cpu")
         activations_dict = data["activations"]
     else:
-        print("\n[Phase 1] Generating Retina activations for all spatial patches using sk_generate_activations.py...")
+        print(f"\n[Phase 1] Generating Retina activations for {T} frames locally...")
         
-        # Optional flags for batching. The user requested we use their inputs from before.
-        cell_minibatch = 500
-        temp_batch = 64
+        # Initialize Retina model once for all patches
+        retina = setup_retina(params, fps, 500, 64, args.device)
         
-        # Prepare python execution (using current sys.executable or plain 'python')
-        import sys
-        python_exec = sys.executable
-        
-        for r in tqdm(range(rows)):
+        for r in tqdm(range(rows), desc="Rows"):
             for c in range(cols):
                 y_start = r * patch_h
                 x_start = c * patch_w
                 
-                tmp_act_path = f"tmp_act_r{r}_c{c}.h5"
+                # Crop locally from the first_chunk we already have in RAM
+                chunk_cropped = crop_video(first_chunk, H_full, W_full, x_start, y_start, patch_h, patch_w)
                 
-                # Execute the script
-                cmd = [
-                    python_exec, "sk_generate_activations.py",
-                    "--video", args.video,
-                    "--params", args.params,
-                    "--output", tmp_act_path,
-                    "--x", str(x_start),
-                    "--y", str(y_start),
-                    "--cell-minibatch", str(cell_minibatch),
-                    "--temp-batch", str(temp_batch),
-                    "--device", args.device
-                ]
+                # GPU forward pass
+                chunk_tensor = torch.from_numpy(np.ascontiguousarray(chunk_cropped)).to(args.device).float()
+                with torch.no_grad():
+                    _, chunk_rates = retina(chunk_tensor, pad=False)
                 
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                if result.returncode != 0:
-                    print(f"Error running sk_generate_activations for patch ({r}, {c})!")
-                    print(result.stderr)
-                    return
+                # Store in dict (expecting list of tensors in T_windows, n_cells format)
+                # chunk_rates is list of (n_cells, T_windows), so we transpose
+                activations_dict[(r, c)] = [rate.cpu().T for rate in chunk_rates]
                 
-                # Load the generated activations from HDF5
-                with h5py.File(tmp_act_path, 'r') as f:
-                    trials_grp = f["trials"]
-                    first_k = list(trials_grp.keys())[0]
-                    fr_grp = trials_grp[first_k]["firing_rates"]
-                    fr_list = []
-                    for m_idx in range(len(fr_grp.keys())):
-                        fr_list.append(torch.from_numpy(fr_grp[str(m_idx)][:]))
-                    activations_dict[(r, c)] = fr_list
-                
-                # Remove tmp file to save disk space
-                os.remove(tmp_act_path)
+                del chunk_tensor, chunk_rates, chunk_cropped
+                torch.cuda.empty_cache()
                 
         # Save the consolidated activations
         print(f"\nSaving consolidated activations to {args.output_activations}...")
@@ -170,10 +154,10 @@ def main():
     sample_act = activations_dict[(0,0)]
     input_window = train_params.get("input_window_size", 1)
     
-    n_cells_per_mosaic = [act.shape[0] * input_window for act in sample_act]
+    n_cells_per_mosaic = [act.shape[1] * input_window for act in sample_act]
     decoder, _ = setup_decoder(params, train_params, n_cells_per_mosaic=n_cells_per_mosaic, device=args.device, weights_path=args.weights)
     
-    n_windows = sample_act[0].shape[1]
+    n_windows = sample_act[0].shape[0]
     decoded_T = n_windows - input_window + 1
     output_buffer = np.zeros((decoded_T, H_pad, W_pad), dtype=np.float32)
     
@@ -185,7 +169,7 @@ def main():
             x_start = c * patch_w
             x_end = x_start + patch_w
             
-            firing_rates_list = activations_dict[(r, c)]
+            firing_rates_list = [a.T for a in activations_dict[(r, c)]]
             if args.zero_celltype is not None:
                 for celltype in args.zero_celltype:
                     firing_rates_list[celltype][:, :] = 0.0
