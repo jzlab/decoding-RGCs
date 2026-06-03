@@ -347,6 +347,10 @@ class RetinalGanglionCellMosaic(nn.Module):
                 return lambda x: alpha / (1.0 + torch.exp(-beta * (x - gamma)))
             case "relu":
                 return lambda x: alpha * torch.clamp(beta * (x - gamma), min=0.0)
+            case "exp":
+                return lambda x: alpha * torch.exp(beta * (x - gamma))
+            case "ppc":
+                return lambda x: x**alpha / (beta * x + 1)
             case _:
                 return lambda x: x
 
@@ -640,6 +644,8 @@ class SmoothMonostratifiedCellMosaic(RetinalGanglionCellMosaic):
                 return lambda x: alpha / (1.0 + torch.exp(-beta * (x - gamma)))
             case "relu":
                 return lambda x: alpha * torch.clamp(beta * (x - gamma), min=0.0)
+            case "exp":
+                return lambda x: alpha * torch.exp(beta * (x - gamma))
             case _:
                 return lambda x: x
 

@@ -180,12 +180,12 @@ ON_Smooth_Monostratified:
     alpha: 1
     beta: 2
     gamma: 0
-    type: soft-rectifier
+    type: ppc
   subunit_nonlinearity:
     alpha: 1
-    beta: 2
+    beta: 1
     gamma: 0
-    type: soft-rectifier
+    type: exp
 
 
 video_parameters:
