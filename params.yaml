@@ -9,7 +9,7 @@ ON_Parasol:
     center_strength: 1
     surround_strength: -0.5
   temporal:
-    memory_ms: 250
+    memory_frames: 16
     amp1: 0.6
     amp2: 0.3
     peak1_ms: 35
@@ -39,7 +39,7 @@ OFF_Parasol:
     center_strength: 1.0 
     surround_strength: -0.5
   temporal:
-    memory_ms: 250
+    memory_frames: 16
     amp1: 0.5
     amp2: 0.15
     peak1_ms: 20
@@ -69,7 +69,7 @@ ON_Midget:
     center_strength: 1.0 
     surround_strength: -0.5
   temporal:
-    memory_ms: 250
+    memory_frames: 16
     amp1: 0.5
     amp2: 0.15
     peak1_ms: 30
@@ -99,7 +99,7 @@ OFF_Midget:
     center_strength: 1.0 
     surround_strength: -0.5
   temporal:
-    memory_ms: 250
+    memory_frames: 16
     amp1: 0.5
     amp2: 0.05
     peak1_ms: 30
@@ -135,7 +135,7 @@ ON_Smooth_Monostratified:
     # per-subunit temporal filters — each subunit has distinct dynamics
     # subunit 0: fast, sharp transient
     subunit_0:
-      memory_ms: 250
+      memory_frames: 16
       amp1: 0.6
       amp2: 0.3
       peak1_ms: 25
@@ -144,7 +144,7 @@ ON_Smooth_Monostratified:
       width2_ms: 30
     # subunit 1: intermediate, slightly delayed
     subunit_1:
-      memory_ms: 250
+      memory_frames: 16
       amp1: 0.5
       amp2: 0.2
       peak1_ms: 35
@@ -153,7 +153,7 @@ ON_Smooth_Monostratified:
       width2_ms: 40
     # subunit 2: slowest, most sustained
     subunit_2:
-      memory_ms: 250
+      memory_frames: 16
       amp1: 0.4
       amp2: 0.1
       peak1_ms: 45
@@ -162,7 +162,7 @@ ON_Smooth_Monostratified:
       width2_ms: 50
     # subunit 3: intermediate, similar to subunit 1 but slightly different
     subunit_3:
-      memory_ms: 250
+      memory_frames: 16
       amp1: 0.5
       amp2: 0.25
       peak1_ms: 30

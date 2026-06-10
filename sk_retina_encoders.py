@@ -15,6 +15,14 @@ import torch.nn.functional as f
 from sk_utils import Utils as u
 from skimage.transform import resize
 
+__all__ = [
+    "Retina",
+    "RetinalGanglionCellMosaic",
+    "SmoothMonostratifiedCellMosaic",
+    "UnnamedCellMosaic",
+]
+
+
 class Retina(nn.Module):
     """
     stores and manages multiple RGC Mosaics
@@ -216,7 +224,8 @@ class RetinalGanglionCellMosaic(nn.Module):
             torch.Tensor: The 1D temporal filter weights.
         """
 
-        memory = int(self.m_params["temporal"]["memory_ms"] * (self.v_params["frame_rate"] / 1000))
+        temporal_cfg = self.m_params["temporal"]
+        memory = int(temporal_cfg.get("memory_frames", temporal_cfg.get("memory_ms", 16)))
         dt_ms = 1000. / self.v_params["frame_rate"]
         t_ms = torch.arange(memory, dtype=torch.float32) * dt_ms
 
@@ -390,29 +399,36 @@ class RetinalGanglionCellMosaic(nn.Module):
         t_batch_size = self.temporal_batch_size if self.temporal_batch_size else n_windows
         c_batch_size = self.cell_minibatch_size if self.cell_minibatch_size else self.n_cells
 
-        linear = torch.zeros((self.n_cells, n_windows), device=x.device, dtype=torch.float32)
+        # Accumulate chunked responses with out-of-place concatenation so this
+        # path is compatible with torch.vmap / batched inference.
+        cell_chunks = []
 
         # Vectorized hierarchical batching
-        for t_start in range(0, n_windows, t_batch_size):
-            t_end = min(t_start + t_batch_size, n_windows)
-            
-            # Select frame chunk: (T_chunk, Win_size, Padded_Pixels)
-            x_chunk = x_win_flat[t_start:t_end]
-            
-            for c_start in range(0, self.n_cells, c_batch_size):
-                c_end = min(c_start + c_batch_size, self.n_cells)
-                
-                # Extract indices for this minibatch: (C_chunk, RF_Pixels)
-                indices = self.rf_indices_tensor[c_start:c_end]
-                
+        for c_start in range(0, self.n_cells, c_batch_size):
+            c_end = min(c_start + c_batch_size, self.n_cells)
+
+            # Extract indices for this minibatch: (C_chunk, RF_Pixels)
+            indices = self.rf_indices_tensor[c_start:c_end]
+
+            time_chunks = []
+            for t_start in range(0, n_windows, t_batch_size):
+                t_end = min(t_start + t_batch_size, n_windows)
+
+                # Select frame chunk: (T_chunk, Win_size, Padded_Pixels)
+                x_chunk = x_win_flat[t_start:t_end]
+
                 # Shape: (T_chunk, Win_size, C_chunk, RF_Pixels)
-                patches = x_chunk[:, :, indices] 
-                
+                patches = x_chunk[:, :, indices]
+
                 # Reshape to (T_chunk, C_chunk, Win_size * RF_Pixels)
                 patches = patches.permute(0, 2, 1, 3).reshape(t_end - t_start, c_end - c_start, -1)
-                
+
                 # Matrix multiplication with shared filter w: (T_chunk, C_chunk)
-                linear[c_start:c_end, t_start:t_end] = (patches @ self.w).T
+                time_chunks.append((patches @ self.w).T)
+
+            cell_chunks.append(torch.cat(time_chunks, dim=1))
+
+        linear = torch.cat(cell_chunks, dim=0)
 
         # Apply activation and cap firing rate
         nonlinear = self.nonlinearity(linear)
@@ -576,7 +592,7 @@ class SmoothMonostratifiedCellMosaic(RetinalGanglionCellMosaic):
         for i in range(self.n_subunits):
             t_params = self.m_params["temporal"][f"subunit_{i}"]
 
-            memory = int(t_params["memory_ms"] * (self.v_params["frame_rate"] / 1000))
+            memory = int(t_params.get("memory_frames", t_params.get("memory_ms", 16)))
             dt_ms = 1000. / self.v_params["frame_rate"]
             t_ms = torch.arange(memory, dtype=torch.float32) * dt_ms
 
@@ -697,19 +713,18 @@ class SmoothMonostratifiedCellMosaic(RetinalGanglionCellMosaic):
             # Get this subunit's flattened spatiotemporal filter
             w_sub = getattr(self, f"w_sub_{sub_idx}")
 
-            # Compute linear response for this subunit across all cells
-            subunit_linear = torch.zeros(
-                (self.n_cells, n_windows), device=x.device, dtype=torch.float32
-            )
+            # Compute linear response for this subunit across all cells using
+            # out-of-place chunk accumulation, which is compatible with vmap.
+            subunit_chunks = []
 
-            for t_start in range(0, n_windows, t_batch_size):
-                t_end = min(t_start + t_batch_size, n_windows)
-                x_chunk = x_win_flat[t_start:t_end]
+            for c_start in range(0, self.n_cells, c_batch_size):
+                c_end = min(c_start + c_batch_size, self.n_cells)
+                indices = self.rf_indices_tensor[c_start:c_end]
 
-                for c_start in range(0, self.n_cells, c_batch_size):
-                    c_end = min(c_start + c_batch_size, self.n_cells)
-
-                    indices = self.rf_indices_tensor[c_start:c_end]
+                time_chunks = []
+                for t_start in range(0, n_windows, t_batch_size):
+                    t_end = min(t_start + t_batch_size, n_windows)
+                    x_chunk = x_win_flat[t_start:t_end]
 
                     # (T_chunk, Win_size, C_chunk, RF_Pixels)
                     patches = x_chunk[:, :, indices]
@@ -719,14 +734,39 @@ class SmoothMonostratifiedCellMosaic(RetinalGanglionCellMosaic):
                         t_end - t_start, c_end - c_start, -1
                     )
 
-                    # Dot product with this subunit's filter
-                    subunit_linear[c_start:c_end, t_start:t_end] = (patches @ w_sub).T
+                    # Dot product with this subunit's filter: (C_chunk, T_chunk)
+                    time_chunks.append((patches @ w_sub).T)
+
+                subunit_chunks.append(torch.cat(time_chunks, dim=1))
+
+            subunit_linear = torch.cat(subunit_chunks, dim=0)
 
             # Apply subunit nonlinearity BEFORE summation (the key LN-LN step)
-            summed_subunit_response += self.subunit_nonlinearity(subunit_linear)
+            summed_subunit_response = (
+                summed_subunit_response + self.subunit_nonlinearity(subunit_linear)
+            )
 
         # Apply output nonlinearity and clamp firing rate
         firing_rate = self.nonlinearity(summed_subunit_response)
         firing_rate = torch.clamp(firing_rate, max=float(self.m_params["max_firing_rate"]))
 
         return summed_subunit_response, firing_rate
+
+class UnnamedCellMosaic(nn.Module):
+    """a really simple conv-style model to optimize to see
+    what "new" cell type appears
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(1, 1, kernel_size=16, stride=16)
+        self.conv2 = nn.Conv2d(1, 1, kernel_size=2, stride=2)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+
+        x = self.relu(self.conv1(x))
+        x = self.relu(self.conv2(x))
+
+        return x

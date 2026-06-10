@@ -22,8 +22,8 @@ class BF_batchNorm(nn.Module):
             sd_x = torch.sqrt(x.var(dim=(0, 2, 3), keepdim=True, unbiased=False) + 1e-05)
             x = x / sd_x.expand_as(x)
             with torch.no_grad():
-                # Update running standard deviation with 0.1 momentum
-                self.running_sd.copy_(0.9 * self.running_sd.data + 0.1 * sd_x)
+                # Update running standard deviation with 0.1 momentum using an out-of-place assignment so this also works under torch.vmap.
+                self.running_sd = 0.9 * self.running_sd + 0.1 * sd_x
             x = x * self.gammas.expand_as(x)
         else:
             # At inference, use the running standard deviation
