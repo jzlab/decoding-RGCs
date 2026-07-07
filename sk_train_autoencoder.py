@@ -1,257 +1,221 @@
 import argparse
-import itertools
-import os
+import h5py
 
-import decord
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, IterableDataset, get_worker_info
-from torch.utils._pytree import tree_map
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from sk_retina_autoencoder import RetinaAutoencoder
 from sk_utils import Utils as u
 
-def _to_gray(raw):
-    return (raw @ np.array([0.2989, 0.5870, 0.1140], dtype=np.float32)) / 255.0
+class VideoWindowDataset(Dataset):
+    
+    def __init__(self, h5_path, videos, target_h, target_w, crop_coords=(0, 0), window_size=16, random_crops=False, seed=0):
+        """torch.utils.data.Dataset that takes an h5 file of video frames
+        and produces windows for training
 
-def crop_video(frames, H_full, W_full, x_start, y_start, target_h, target_w):
-    x_end, y_end = x_start + target_w, y_start + target_h
-    if x_end <= W_full and y_end <= H_full:
-        return frames[:, y_start:y_end, x_start:x_end]
+        Args:
+            h5_path (str): path to h5 file containing videos
+            target_h (int): height of output training examples
+            target_w (int): width of output training examples
+            crop_coords (tuple, optional): for fixed training (x,y) positions. Defaults to (0, 0).
+            window_size (int, optional): window size used in training to output. Defaults to 16.
+            random_crops (bool, optional): whether random (x,y) positions should be used. Defaults to False.
+                                           Overrides crop_coords.
+            seed (int, optional): random seed to use for reproducibility. Defaults to 0.
+        """
 
-    valid_x_end = min(x_end, W_full)
-    valid_y_end = min(y_end, H_full)
-    crop = frames[:, y_start:valid_y_end, x_start:valid_x_end]
-    pad_w = target_w - crop.shape[2]
-    pad_h = target_h - crop.shape[1]
-    return np.pad(crop, ((0, 0), (0, pad_h), (0, pad_w)), mode="constant")
-
-class VideoWindowIterableDataset(IterableDataset):
-    """
-    Streams fixed temporal windows sampled randomly from a list of videos.
-
-    VideoReader objects are opened inside __iter__, after DataLoader forks
-    worker processes, so each worker owns its own file handles. Video paths
-    are sharded across workers to avoid redundant I/O.
-
-    Args:
-        video_paths:  List of paths to video files.
-        target_h:     Crop height in pixels.
-        target_w:     Crop width in pixels.
-        crop_coords:  Fixed (x, y) top-left crop coordinate. Ignored when
-                      random_crops=True.
-        window_size:  Number of frames in the prediction target.
-        overlap:      Number of preceding context frames prepended to each
-                      window (typically window_size - 1 for a causal model).
-        random_crops: If True, sample a uniformly random crop origin per window.
-        seed:         Base RNG seed. Each worker derives an independent seed
-                      from [seed, worker_id] to avoid correlated sampling.
-    """
-
-    def __init__(
-        self,
-        video_paths,
-        target_h,
-        target_w,
-        crop_coords=(0, 0),
-        window_size=16,
-        overlap=15,
-        random_crops=False,
-        seed=0,
-    ):
-        super().__init__()
-        self.video_paths = list(video_paths)
+        self.h5_path = h5_path
         self.target_h = int(target_h)
         self.target_w = int(target_w)
         self.crop_coords = tuple(crop_coords)
         self.window_size = max(1, int(window_size))
-        self.overlap = max(0, int(overlap))
         self.random_crops = bool(random_crops)
-        self.seed = int(seed)
-        self._min_frames = self.window_size + self.overlap
+        np.random.seed(seed)
+        
+        # read the h5 file
+        self.data = h5py.File(h5_path, "r")
+        self.videos = videos
+        self.data_len = int(np.sum([self.data[ds].attrs["frame_count"] for ds in videos]) / self.window_size)
 
-    def _sample_crop(self, rng, h_full, w_full):
+    def __len__(self):
+        """returns number of windows for training
+
+        Returns:
+            int: number of windows in the train_dataset
+        """
+
+        return self.data_len
+
+    def __getitem__(self, idx):
+        """produces next item/batch
+
+        Args:
+            idx (int): idx of window to return
+
+        Returns:
+            (torch.Tensor, torch.Tensor): the window sample, the window target
+        """
+
+        # get the right video to pull from and the start frame
+        video = self.videos[idx % len(self.videos)]
+        start_frame_idx = max(0, int(((idx / len(self.videos) * 0.9) - (idx // len(self.videos))) * self.data[video].attrs["frame_count"]))
+
+        # get the right window and squeeze the first dim since this is stored [W, 1, H, W]
+        window = self.data[video][start_frame_idx:start_frame_idx+self.window_size]
+
+        # crop and return
         if self.random_crops:
-            x = int(rng.integers(0, max(1, w_full - self.target_w + 1)))
-            y = int(rng.integers(0, max(1, h_full - self.target_h + 1)))
-            return x, y
-        return self.crop_coords
+            self.crop_coords = (np.random.randint(0, self.data[video].attrs["original_w"] - self.target_w), np.random.randint(0, self.data[video].attrs["original_h"] - self.target_h))
+        crop = torch.Tensor(window[:, self.crop_coords[1]:self.crop_coords[1]+self.target_h, self.crop_coords[0]:self.crop_coords[0]+self.target_w])
+        return crop, crop[-1].unsqueeze(0)
 
-    def _read_window(self, rng, vr):
-        total_frames = len(vr)
-        if total_frames < self._min_frames:
-            return None
+def train_autoencoder(data_path, cell_params, training_params_path, output_path, args):
+    """train the RetinaAutoencoder end-to-end
 
-        start = int(rng.integers(0, total_frames - self.window_size + 1))
-        end = start + self.window_size
+    Args:
+        data_path (str): path to the h5 file containing training examples
+        cell_params (dict): parameters necessary for setting up retina cell type encoders
+        training_params_path (str): path to training params file
+        output_path (str): path to store model weights
+        args (argparse.ArgumentParser): stores other arguments for training
 
-        raw = vr.get_batch(list(range(start, end))).asnumpy()
-        frames = _to_gray(raw).astype(np.float32)
-
-        h_full, w_full = frames.shape[1], frames.shape[2]
-        cx, cy = self._sample_crop(rng, h_full, w_full)
-        frames = crop_video(frames, h_full, w_full, cx, cy, self.target_h, self.target_w)
-
-        input_frames = torch.from_numpy(np.ascontiguousarray(frames[:self.window_size]))
-        target_frames = input_frames[-1:]
-        return input_frames, target_frames
-
-    def __iter__(self):
-        worker_info = get_worker_info()
-
-        if worker_info is not None:
-            paths = self.video_paths[worker_info.id :: worker_info.num_workers]
-            rng = np.random.default_rng([self.seed, worker_info.id])
-        else:
-            paths = self.video_paths
-            rng = np.random.default_rng(self.seed)
-
-        if not paths:
-            return
-
-        # Open readers inside the worker, after fork, so handles are not shared.
-        readers = []
-        for p in paths:
-            try:
-                readers.append(decord.VideoReader(p, ctx=decord.cpu(0)))
-            except Exception as e:
-                wid = worker_info.id if worker_info else 0
-                print(f"[worker {wid}] Could not open {p}: {e}")
-
-        readers = [vr for vr in readers if len(vr) >= self._min_frames]
-
-        if not readers:
-            wid = worker_info.id if worker_info else 0
-            print(f"[worker {wid}] No usable videos after filtering.")
-            return
-
-        while True:
-            vr = readers[int(rng.integers(0, len(readers)))]
-            result = self._read_window(rng, vr)
-            if result is not None:
-                yield result
-
-def train_autoencoder(video_paths, params, training_params_path, output_path, args):
-    """Train the decoder end-to-end across all configured videos."""
+    Raises:
+        ValueError: raised if some cell types are not present
+    """
+    
+    # set up the data for training
+    print(f"Setting up the Dataset and Loader: {data_path}")
     train_cfg = u.read_params(training_params_path)
-    video_params = dict(params.get("video_parameters", {}))
-    fps = u.read_video(video_paths[0], stream=True, chunk_frames=1)[1]["fps"]
-    video_params["frame_rate"] = fps
-    target_h, target_w = video_params.get("frame_shape", [128, 128])
+    video_params = dict(cell_params.get("video_parameters", {}))
+    window_size = train_cfg.get("input_window_size", 16)
+    target_h, target_w = train_cfg.get("target_height", 128), train_cfg.get("target_width", 128)
 
-    print(f"Initializing model with {len(video_paths)} videos, frame shape {target_h}x{target_w}")
-    model = RetinaAutoencoder(
-        {k: v for k, v in params.items() if k != "video_parameters"},
-        video_params,
+    with h5py.File(data_path, "r") as f:
+        h5_file = h5py.File(data_path)
+        videos = np.array(list(h5_file.keys()))
+    train_videos_idx = np.random.choice([0,1], size=videos.shape, p=[0.1,0.9])
+    train_videos = [v for v,i in zip(videos,train_videos_idx) if i == 1]
+    val_videos = [v for v,i in zip(videos,train_videos_idx) if i == 0]
+
+    train_dataset = VideoWindowDataset(h5_path=data_path, videos=train_videos, target_h=target_h, target_w=target_w, crop_coords=(args.x or 0, args.y or 0), window_size=window_size, random_crops=args.random_crops, seed=args.seed)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size or 1, num_workers=args.num_workers or 0, pin_memory=args.device.startswith("cuda"), persistent_workers=(args.num_workers or 0) > 0, shuffle=True)
+    val_dataset = VideoWindowDataset(h5_path=data_path, videos=val_videos, target_h=target_h, target_w=target_w, crop_coords=(args.x or 0, args.y or 0), window_size=window_size, random_crops=args.random_crops, seed=args.seed)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size or 1, num_workers=args.num_workers or 0, pin_memory=args.device.startswith("cuda"), persistent_workers=(args.num_workers or 0) > 0, shuffle=True)
+    print(f"{len(train_dataset.videos):,} videos loaded for training with a total of {train_dataset.data_len:,} windows.")
+    print(f"{len(val_dataset.videos)} videos loaded for validation with a total of {val_dataset.data_len:,} windows.")
+
+    # inititalize the model using only the required cell types
+    requested_cell_types = train_cfg.get("cell_types", None)
+    all_cell_params = {k: v for k, v in cell_params.items() if k != "video_parameters"}
+    if requested_cell_types is not None:
+        missing = [ct for ct in requested_cell_types if ct not in all_cell_params]
+        if missing:
+            raise ValueError(f"cell_types listed in params_training.yaml not found in params.yaml: {missing}")
+        active_cell_params = {ct: all_cell_params[ct] for ct in requested_cell_types}
+    else:
+        active_cell_params = all_cell_params
+
+    print(f"Initializing model with frame shape {target_h:,}x{target_w:,} and {list(active_cell_params.keys())} active cell types")
+    model = RetinaAutoencoder(active_cell_params, video_params,
         decoder_params={
             "frame_shape": (target_h, target_w),
             "num_blocks": train_cfg.get("num_blocks", 4),
             "num_kernels": train_cfg.get("num_kernels", 64),
             "bias": train_cfg.get("bias", False),
-        },
-        cell_minibatch_size=args.cell_minibatch,
-        temporal_batch_size=args.temp_batch,
-    ).to(args.device)
+        }).to(args.device)
+    print(f"Model transferred to {next(model.parameters()).device} with {sum(p.numel() for p in model.parameters()):,} total parameters.")
 
+    # set up optimizer, loss, learning rate
     lr = args.lr or train_cfg.get("learning_rate", 1e-4)
-    print(f"Using optimizer settings: lr={lr}")
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
+    print(f"using {optimizer.__class__.__name__} with lr={lr} and {type(criterion).__name__} loss")
 
-    window_size = params.get("ON_Parasol").get("temporal").get("window_size", 16)
-    overlap = 0
-
-    dataset = VideoWindowIterableDataset(
-        video_paths=video_paths,
-        target_h=target_h,
-        target_w=target_w,
-        crop_coords=(args.x or 0, args.y or 0),
-        window_size=window_size,
-        overlap=overlap,
-        random_crops=args.random_crops,
-        seed=args.seed,
-    )
-
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size or 1,
-        num_workers=args.num_workers or 0,
-        pin_memory=args.device.startswith("cuda"),
-        # persistent_workers keeps worker processes alive across steps,
-        # avoiding the overhead of re-opening VideoReaders each epoch.
-        persistent_workers=(args.num_workers or 0) > 0,
-    )
-
+    # start training!
     n_epochs = args.epochs or train_cfg.get("epochs", 1)
-    steps_per_epoch = args.steps_per_epoch or train_cfg.get("steps_per_epoch", 1000)
-    print(f"Starting training: {n_epochs} epochs x {steps_per_epoch} steps, batch size {args.batch_size or 1}")
-    print(f"Training on device: {args.device}")
+    print(f"Training for {n_epochs:,} epochs with batch size {args.batch_size or 1:,}")
+    progress_bar = tqdm(np.arange(n_epochs), leave=True)
+    train_loss_history = []
+    val_loss_history = []
 
-    model.train()
-    for epoch in tqdm(range(n_epochs), desc="Autoencoder epochs"):
+    for epoch in progress_bar:
+        progress_bar.set_description(f"Epoch [{epoch+1:,}/{n_epochs:,}]")
         epoch_loss = 0.0
         n_batches = 0
 
-        for batch_input, batch_target in itertools.islice(loader, steps_per_epoch):
+        model.train()
+        for batch_input, batch_target in train_loader:
+            # batch_input:  (B, T, H, W)
+            # batch_target: (B, 1, H, W)
             batch_input = batch_input.to(args.device).float()
             batch_target = batch_target.to(args.device).float()
 
             optimizer.zero_grad()
+            batch_loss = 0.0
 
-            # Run the full batch through the encoder/decoder path in one vectorized pass.
-            recon_batch = torch.vmap(
-                lambda sample_input: model(sample_input, encoder_grad_types=args.encoder_grad)[0].squeeze(1)
-            )(batch_input)
+            recon, _, _ = model(batch_input, encoder_grad_types=args.encoder_grad)
+            batch_loss += criterion(recon, batch_target)
 
-            batch_loss = criterion(recon_batch, batch_target)
+            batch_loss = batch_loss / batch_input.size(0)
             batch_loss.backward()
             optimizer.step()
 
             epoch_loss += batch_loss.item()
             n_batches += 1
+        train_loss_history.append(epoch_loss)
 
-        print(f"Epoch {epoch + 1:03d} | loss={epoch_loss / max(1, n_batches):.6f}")
+        # validation
+        model.eval()
+        val_loss = 0
+        val_batches = 0
+        for val_input, val_target in val_loader:
+            val_batches += 1
+            val_input = val_input.to(args.device).float()
+            val_target = val_target.to(args.device).float()
+            recon, _, _ = model(val_input)
+            val_loss += criterion(recon, val_target).item() / val_input.size(0)
 
-    state_dict = tree_map(lambda x: x[0], batched_params)
-    torch.save({"model_state_dict": model.decoder.state_dict()}, output_path)
-    print(f"Saved decoder weights to {output_path}")
+        # store the model if it's better than previous
+        val_loss_history.append(val_loss)
+        if val_loss < min(val_loss_history):
+            torch.save({
+                "model_state_dict": model.decoder.state_dict(),
+                "train_loss_history": train_loss_history,
+                "val_loss_history": val_loss_history
+                }, f"{output_path.split('.')[0]}_best.pt")
+
+        progress_bar.set_postfix(train_loss=epoch_loss, val_loss=val_loss)
+
+    torch.save({
+        "model_state_dict": model.decoder.state_dict(),
+        "train_loss_history": train_loss_history,
+        "val_loss_history": val_loss_history
+        }, f"{output_path.split('.')[0]}_last.pt")
+    print(f"Saved decoder weights to {output_path.split('.')[0]}_last.pt")
 
 def main():
-    parser = argparse.ArgumentParser(description="Train the decoder in one pass from video windows.")
-    parser.add_argument("--video", type=str, required=True, help="Video file or directory of videos to use.")
-    parser.add_argument("--params", type=str, default="params.yaml", help="Path to the retina model parameters.")
-    parser.add_argument("--training-params", type=str, default="params_training.yaml", help="Path to training settings.")
-    parser.add_argument("--output", type=str, default="best_autoencoder_decoder.pt", help="Where to save the trained decoder.")
+    parser = argparse.ArgumentParser(description="Train the retina autoencoder decoder from video windows.")
+    parser.add_argument("--videos", type=str, required=True, help="h5 file containing videos.")
+    parser.add_argument("--cell-params", type=str, default="params.yaml")
+    parser.add_argument("--training-params", type=str, default="params_training.yaml")
+    parser.add_argument("--output", type=str, default="best_autoencoder_decoder.pt")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--steps-per-epoch", type=int, default=None, help="Number of gradient steps per epoch.")
-    parser.add_argument("--batch-size", type=int, default=1, help="Number of video windows per training step.")
+    parser.add_argument("--batch-size", type=int, default=1, help="Video windows per training step.")
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader worker processes.")
-    parser.add_argument("--encoder-grad", nargs="*", default=None, help="Cell types allowed to keep gradients during encoding.")
+    parser.add_argument("--encoder-grad", nargs="*", default=None, help="Cell types that retain gradients during encoding.")
     parser.add_argument("--x", type=int, default=0, help="Top-left X crop coordinate.")
     parser.add_argument("--y", type=int, default=0, help="Top-left Y crop coordinate.")
-    parser.add_argument("--random-crops", action="store_true", help="Use a random crop for every sampled training window.")
-    parser.add_argument("--cell-minibatch", type=int, default=512, help="Cells per vectorized batch.")
-    parser.add_argument("--temp-batch", type=int, default=64, help="Temporal windows per batch.")
-    parser.add_argument("--seed", type=int, default=1234, help="Base RNG seed for reproducible sampling.")
+    parser.add_argument("--random-crops", action="store_true")
+    parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
 
-    params = u.read_params(args.params)
-
-    if os.path.isdir(args.video):
-        video_files = sorted([
-            os.path.join(args.video, f)
-            for f in os.listdir(args.video)
-            if f.endswith((".mp4", ".avi", ".mkv"))
-        ])
-    else:
-        video_files = [args.video]
-
-    train_autoencoder(video_files, params, args.training_params, args.output, args)
-
+    params = u.read_params(args.cell_params)
+    train_autoencoder(args.videos, params, args.training_params, args.output, args)
 
 if __name__ == "__main__":
     main()

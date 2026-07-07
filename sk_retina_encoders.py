@@ -1,19 +1,9 @@
-import os
-import sys
-import time
 import math
-import random
 import numpy as np
-
-from tqdm import tqdm
-from scipy import ndimage
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as f
-
-from sk_utils import Utils as u
-from skimage.transform import resize
 
 __all__ = [
     "Retina",
@@ -24,329 +14,215 @@ __all__ = [
 
 
 class Retina(nn.Module):
-    """
-    stores and manages multiple RGC Mosaics
-    """
+    """Stores and manages multiple RGC mosaics."""
 
-    def __init__(self, model_parameters:dict, video_parameters:dict, cell_minibatch_size:int=None, temporal_batch_size:int=None):
-        """
-        stores and manages multiple RetinalGanglionCellMosaics
-        """
+    def __init__(self, model_parameters: dict, video_parameters: dict):
         super().__init__()
 
         self.m_params = model_parameters
         self.v_params = video_parameters
-        self.cell_minibatch_size = cell_minibatch_size
-        self.temporal_batch_size = temporal_batch_size
 
         self.mosaics = nn.ModuleList()
         for cell_type, params in self.m_params.items():
             if cell_type != "video_parameters":
                 if "Smooth_Monostratified" in cell_type:
-                    self.mosaics.append(SmoothMonostratifiedCellMosaic(
-                        params, 
-                        self.v_params, 
-                        cell_minibatch_size=self.cell_minibatch_size,
-                        temporal_batch_size=self.temporal_batch_size
-                    ))
+                    self.mosaics.append(SmoothMonostratifiedCellMosaic(params, self.v_params))
                 else:
-                    self.mosaics.append(RetinalGanglionCellMosaic(
-                        params, 
-                        self.v_params, 
-                        cell_minibatch_size=self.cell_minibatch_size,
-                        temporal_batch_size=self.temporal_batch_size
-                    ))
+                    self.mosaics.append(RetinalGanglionCellMosaic(params, self.v_params))
 
-        # store the max number of cells to pad properly
-        self.n_cells = max([m.n_cells for m in self.mosaics])
+        self.n_cells = max(m.n_cells for m in self.mosaics)
 
     def forward(self, x, pad=True):
-        """perform a forward pass through each RGC mosaic
+        """Forward pass through each RGC mosaic.
 
         Args:
-            x (torch.Tensor): input video of shape (T, H, W)
+            x (torch.Tensor): Input video of shape (B, T, H, W).
 
         Returns:
-            tuple: (linear_responses, firing_rates)
+            tuple: (linear_responses, firing_rates), each (n_mosaics, n_cells, B).
         """
-
-        # pass through each mosaic
         res_linear = []
-        res_rate = []
+        res_rate   = []
         for mosaic in self.mosaics:
-            lin, rate = mosaic.forward(x)
+            lin, rate = mosaic(x)
             res_linear.append(lin)
             res_rate.append(rate)
 
-        # pad the mosaics to the largest cell count
-        # biologically, this is because different RGC mosaics have larger cell count
-        # when they have smaller RFs, so we "create" dummy cells that are not activated
-        # to make the total number of cells equal across mosaics to make vectorization easier
-        def pad_responses(tensors, target_n):
-            padded = []
-            for t in tensors:
-                if t.shape[0] < target_n:
-                    # pad the cell dimension (dim 0)
-                    t = f.pad(t, (0, 0, 0, target_n - t.shape[0]), 'constant', 0)
-                padded.append(t)
-            return padded
-
         if pad:
-            padded_linear = pad_responses(res_linear, self.n_cells)
-            padded_rate = pad_responses(res_rate, self.n_cells)
-            return torch.stack(padded_linear), torch.stack(padded_rate)
-        else:
-            return res_linear, res_rate
+            def pad_to(t, target_n):
+                deficit = target_n - t.shape[0]
+                if deficit > 0:
+                    t = f.pad(t, (0, 0, 0, deficit), mode="constant", value=0)
+                return t
+
+            res_linear = [pad_to(t, self.n_cells) for t in res_linear]
+            res_rate   = [pad_to(t, self.n_cells) for t in res_rate]
+
+        return torch.stack(res_linear), torch.stack(res_rate)
+
 
 class RetinalGanglionCellMosaic(nn.Module):
-    """
-    Model representing a mosaic of Retinal Ganglion Cells (RGCs) that processes 
-    video input through spatiotemporal filtering and non-linear activation.
+    """LN encoding model of a single RGC type mosaic.
+
+    Processes batched video input of shape (B, T, H, W) where T equals
+    the encoder's temporal window size. Each sample in the batch is treated
+    as one independent temporal window.
     """
 
-    def __init__(self, model_parameters: dict, video_parameters: dict, cell_minibatch_size: int = None, temporal_batch_size: int = None):
-        """
-        Initialize the RGC Mosaic model.
-
-        Args:
-            model_parameters (dict): Parameters for spatial, temporal, tiling and nonlinearity configuration.
-            video_parameters (dict): Parameters for video properties like frame rate and shape.
-            cell_minibatch_size (int, optional): Number of cells to process in a single vectorized batch.
-            temporal_batch_size (int, optional): Number of temporal windows to process in a single vectorized batch.
-        """
+    def __init__(self, model_parameters: dict, video_parameters: dict):
         super().__init__()
-        
-        # store the params
+
         self.m_params = model_parameters
         self.v_params = video_parameters
-        self.cell_minibatch_size = cell_minibatch_size
-        self.temporal_batch_size = temporal_batch_size
 
-        # compute the spatiotemporal filter and register components
         self.spatial_filter = self._spatial_filter()
         self.temporal_filter = self._temporal_filter()
         self.spatiotemporal_filter = self._spatiotemporal_filter()
-        
-        # Store filters as buffers for device management
-        self.register_buffer('w', self.spatiotemporal_filter.reshape(-1))
-        self.register_buffer('temporal_filter_tensor', self.temporal_filter)
 
-        # stitch the filters to create the RGC mosaic
+        self.rf_diam = self.m_params["tiling_config"]["rf_diameter"]
+
+        # Conv2d expects:
+        # (out_channels, in_channels, kH, kW)
+        self.register_buffer("w_conv", self.spatiotemporal_filter.unsqueeze(0))
+        self.register_buffer("temporal_filter_tensor", self.temporal_filter)
+
+        # store the mosaic locations
         self.mosaic = self._tile_cells()
-        self.register_buffer('mosaic_tensor', torch.as_tensor(self.mosaic, dtype=torch.float32))
+        self.register_buffer("mosaic_tensor", torch.as_tensor(self.mosaic, dtype=torch.float32))
         self.n_cells = len(self.mosaic)
 
-        # Pre-compute spatial indices for vectorized gathering
-        self.rf_diam = self.m_params["tiling_config"]["rf_diameter"]
-        self.rf_indices = self._calculate_vectorized_indices()
-        self.register_buffer('rf_indices_tensor', self.rf_indices)
+        # Cell locations in response-map coordinates
+        self.register_buffer("cell_x", torch.floor(self.mosaic_tensor[:, 0]).long())
+        self.register_buffer("cell_y", torch.floor(self.mosaic_tensor[:, 1]).long())
 
-        # store the nonlinearity
         self.nonlinearity = self._nonlinearity()
-        
-    def _calculate_vectorized_indices(self):
-        """
-        Pre-compute spatial pixel indices for each cell's receptive field.
-        These indices allow for the extraction of all cell patches in a single
-        vectorized gathering operation.
 
-        Returns:
-            torch.Tensor: Tensor of indices (N_cells, rf_diam * rf_diam).
-        """
-        height, width = self.v_params["frame_shape"]
-        rf_diam = self.rf_diam
-        half_diam = rf_diam / 2.0
-        
-        # We index into a padded frame to handle boundary cells safely.
-        # Padding size equals rf_diam to provide a 'dark' zone for all possible shifts.
-        padded_width = width + 2 * rf_diam
-        
-        # Generate local patch coordinates (offsets from center)
-        y_range = torch.arange(rf_diam)
-        x_range = torch.arange(rf_diam)
-        yy, xx = torch.meshgrid(y_range, x_range, indexing='ij')
-        local_offsets = yy * padded_width + xx
-
-        all_indices = []
-        for pos in self.mosaic_tensor:
-            pos_x, pos_y = pos[0].item(), pos[1].item()
-            
-            # Compute top-left corner of the RF in the PADDED frame.
-            # pos in original: (x, y). In padded: (x + rf_diam, y + rf_diam)
-            # v_start_raw in original: math.floor(pos_y - half_diam)
-            # v_start_padded: math.floor(pos_y - half_diam) + rf_diam
-            v_start_padded = math.floor(pos_y - half_diam) + rf_diam
-            h_start_padded = math.floor(pos_x - half_diam) + rf_diam
-            
-            # Generate flat indices for this cell's patch in the padded frame
-            base_index = v_start_padded * padded_width + h_start_padded
-            cell_indices = local_offsets.flatten() + base_index
-            all_indices.append(cell_indices)
-
-        return torch.stack(all_indices)
+    # ------------------------------------------------------------------
+    # Filter construction
+    # ------------------------------------------------------------------
 
     def _spatial_filter(self):
-        """
-        Compute the spatial receptive field using a Difference of Gaussians (DoG).
-
-        Returns:
-            torch.Tensor: The 2D spatial filter weights.
-        """
-        
         def gaussian_2d(w, h, sigma):
-            # generate coords
             cy, cx = h / 2.0, w / 2.0
-            y = torch.arange(h, dtype=torch.float32)
-            x = torch.arange(w, dtype=torch.float32)
-            yy, xx = torch.meshgrid(y, x, indexing='ij')
+            y  = torch.arange(h, dtype=torch.float32)
+            x  = torch.arange(w, dtype=torch.float32)
+            yy, xx = torch.meshgrid(y, x, indexing="ij")
+            return torch.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sigma ** 2))
 
-            # 2D gaussian and return
-            return torch.exp(-((xx - cx)**2 + (yy - cy)**2) / (2 * sigma**2))
-
-        # create the 2 gaussians and normalize
-        w, h = self.m_params["spatial"]["width"], self.m_params["spatial"]["height"]
-        center = gaussian_2d(w, h, self.m_params["spatial"]["center_size"])
+        w, h     = self.m_params["spatial"]["width"], self.m_params["spatial"]["height"]
+        center   = gaussian_2d(w, h, self.m_params["spatial"]["center_size"])
         surround = gaussian_2d(w, h, self.m_params["spatial"]["surround_size"])
-
-        # normalize and combine
-        center = center / torch.sum(center)
+        center   = center   / torch.sum(center)
         surround = surround / torch.sum(surround)
-        return self.m_params["spatial"]["center_strength"] * center + self.m_params["spatial"]["surround_strength"] * surround
+        return (
+            self.m_params["spatial"]["center_strength"]    * center
+            + self.m_params["spatial"]["surround_strength"] * surround
+        )
 
     def _temporal_filter(self, smooth: bool = True):
-        """
-        Generate the biphasic temporal filter for the model.
-
-        Args:
-            smooth (bool): Whether to apply a smooth onset window (Exponential). Defaults to True.
-
-        Returns:
-            torch.Tensor: The 1D temporal filter weights.
-        """
-
         temporal_cfg = self.m_params["temporal"]
         memory = int(temporal_cfg.get("memory_frames", temporal_cfg.get("memory_ms", 16)))
-        dt_ms = 1000. / self.v_params["frame_rate"]
-        t_ms = torch.arange(memory, dtype=torch.float32) * dt_ms
+        dt_ms  = 1000.0 / self.v_params["frame_rate"]
+        t_ms   = torch.arange(memory, dtype=torch.float32) * dt_ms
 
-        # create the lobes
-        lobe1 = self.m_params["temporal"]["amp1"] * torch.exp(-((t_ms - self.m_params["temporal"]["peak1_ms"])**2) / (2 * self.m_params["temporal"]["width1_ms"]**2))
-        lobe2 = self.m_params["temporal"]["amp2"] * torch.exp(-((t_ms - self.m_params["temporal"]["peak2_ms"])**2) / (2 * self.m_params["temporal"]["width2_ms"]**2))
+        lobe1 = self.m_params["temporal"]["amp1"] * torch.exp(
+            -((t_ms - self.m_params["temporal"]["peak1_ms"]) ** 2)
+            / (2 * self.m_params["temporal"]["width1_ms"] ** 2)
+        )
+        lobe2 = self.m_params["temporal"]["amp2"] * torch.exp(
+            -((t_ms - self.m_params["temporal"]["peak2_ms"]) ** 2)
+            / (2 * self.m_params["temporal"]["width2_ms"] ** 2)
+        )
 
-        # smooth the filter
         if smooth:
-            onset_tau_ms = 15.0
-            onset_window = 1.0 - torch.exp(-t_ms / onset_tau_ms)
+            onset_window = 1.0 - torch.exp(-t_ms / 15.0)
             lobe1 = lobe1 * onset_window
             lobe2 = lobe2 * onset_window
 
-        # biphasic based on ON/OFF + cell type
-        if self.m_params["cell_type"].startswith("OFF"):
-            filter = -lobe1 + lobe2
-        else:
-            filter = lobe1 - lobe2
-
-        return torch.flip(filter, dims=[0])
+        filt = (-lobe1 + lobe2) if self.m_params["cell_type"].startswith("OFF") else (lobe1 - lobe2)
+        return torch.flip(filt, dims=[0])
 
     def _spatiotemporal_filter(self):
-        """
-        Combine spatial and temporal filters into a 3D spatiotemporal filter.
+        st = self.temporal_filter.view(-1, 1, 1) * self.spatial_filter.view(1, *self.spatial_filter.shape)
+        return st / torch.norm(st)
 
-        Returns:
-            torch.Tensor: The 3D filter (frames, height, width).
-        """
-
-        # weight each spatial filter by temporal value and normalize
-        spatiotemporal = self.temporal_filter.view(-1, 1, 1) * self.spatial_filter.view(1, *self.spatial_filter.shape)
-        return spatiotemporal / torch.norm(spatiotemporal)
+    # ------------------------------------------------------------------
+    # Mosaic tiling
+    # ------------------------------------------------------------------
 
     def _tile_cells(self, max_cells=None):
-        """
-        Create hexagonal mosaic of receptive field positions using lattice basis formulation.
-
-        Args:
-            max_cells (int, optional): Maximum number of cells to include. Defaults to None.
-
-        Returns:
-            torch.Tensor: Tensor of (x, y) coordinates for the mosaic.
-        """
-
         height, width = self.v_params["frame_shape"]
-
-        # Adjust spacing
         s = self.m_params["spatial"]["center_size"] / self.m_params["tiling_config"]["coverage_factor"]
 
-        # Hexagonal lattice basis
         B = torch.tensor([
-            [s, s / 2.0],
-            [0.0, s * torch.sqrt(torch.tensor(3.0)) / 2.0]
+            [s,    s / 2.0],
+            [0.0,  s * torch.sqrt(torch.tensor(3.0)) / 2.0],
         ], dtype=torch.float32)
         B_inv = torch.inverse(B)
 
-        # Determine margin constraints
-        margin = self.m_params["spatial"]["center_size"] / 2.0
+        margin  = self.m_params["spatial"]["center_size"] / 2.0
+        corners = torch.tensor([[0,0],[width,0],[0,height],[width,height]], dtype=torch.float32)
+        lc      = corners @ B_inv.T
 
-        # Define rectangle corners in Cartesian space
-        corners = torch.tensor([
-            [0, 0],
-            [width, 0],
-            [0, height],
-            [width, height]
-        ], dtype=torch.float32)
-
-        # Map corners into lattice coordinates
-        lattice_corners = corners @ B_inv.T
-
-        # Compute lattice bounds
-        n_min = int(torch.floor(lattice_corners[:, 0].min())) - 1
-        n_max = int(torch.ceil(lattice_corners[:, 0].max())) + 1
-        m_min = int(torch.floor(lattice_corners[:, 1].min())) - 1
-        m_max = int(torch.ceil(lattice_corners[:, 1].max())) + 1
+        n_min = int(torch.floor(lc[:, 0].min())) - 1
+        n_max = int(torch.ceil( lc[:, 0].max())) + 1
+        m_min = int(torch.floor(lc[:, 1].min())) - 1
+        m_max = int(torch.ceil( lc[:, 1].max())) + 1
 
         all_positions = []
-
-        # Sample lattice and map forward
         for m in range(m_min, m_max + 1):
             for n in range(n_min, n_max + 1):
                 pos = torch.tensor([float(n), float(m)], dtype=torch.float32) @ B.T
                 x, y = pos[0].item(), pos[1].item()
-
-                if (margin <= x <= width - margin and
-                    margin <= y <= height - margin):
+                if margin <= x <= width - margin and margin <= y <= height - margin:
                     all_positions.append((x, y))
 
         all_positions = torch.tensor(all_positions, dtype=torch.float32)
 
-        # Selection strategies
         if max_cells is not None and len(all_positions) > max_cells:
-            if self.m_params["tiling_config"]["selection_method"] in ['center_first', 'edge_first']:
+            method = self.m_params["tiling_config"]["selection_method"]
+            if method in ("center_first", "edge_first"):
                 center_pt = torch.tensor([width / 2.0, height / 2.0], dtype=torch.float32)
                 distances = torch.norm(all_positions - center_pt, dim=1)
-                
-                reverse = (self.m_params["tiling_config"]["selection_method"] == 'edge_first')
-                values, sorted_idx = torch.sort(distances, descending=reverse)
+                _, sorted_idx = torch.sort(distances, descending=(method == "edge_first"))
                 all_positions = all_positions[sorted_idx[:max_cells]]
-            elif self.m_params["tiling_config"]["selection_method"] == 'random':
+            elif method == "random":
                 torch.manual_seed(42)
-                idx = torch.randperm(len(all_positions))[:max_cells]
-                all_positions = all_positions[idx]
-            elif self.m_params["tiling_config"]["selection_method"] == 'grid_order':
+                all_positions = all_positions[torch.randperm(len(all_positions))[:max_cells]]
+            elif method == "grid_order":
                 all_positions = all_positions[:max_cells]
 
-        # offset the cells if necessary
         offset = torch.tensor(self.m_params["tiling_config"]["offset"], dtype=torch.float32)
         return all_positions + offset
 
+    def _calculate_vectorized_indices(self):
+        height, width = self.v_params["frame_shape"]
+        rf_diam       = self.rf_diam
+        half_diam     = rf_diam / 2.0
+        padded_width  = width + 2 * rf_diam
+
+        y_range = torch.arange(rf_diam)
+        x_range = torch.arange(rf_diam)
+        yy, xx  = torch.meshgrid(y_range, x_range, indexing="ij")
+        local_offsets = (yy * padded_width + xx).flatten()
+
+        all_indices = []
+        for pos in self.mosaic_tensor:
+            pos_x, pos_y   = pos[0].item(), pos[1].item()
+            v_start_padded = math.floor(pos_y - half_diam) + rf_diam
+            h_start_padded = math.floor(pos_x - half_diam) + rf_diam
+            base_index     = v_start_padded * padded_width + h_start_padded
+            all_indices.append(local_offsets + base_index)
+
+        return torch.stack(all_indices)
+
+    # ------------------------------------------------------------------
+    # Nonlinearity
+    # ------------------------------------------------------------------
+
     def _nonlinearity(self):
-        """
-        Define the nonlinearity to use for the model.
-
-        Returns:
-            func: A lambda function that applies the activation.
-        """
-
         alpha = self.m_params["nonlinearity"]["alpha"]
-        beta = self.m_params["nonlinearity"]["beta"]
+        beta  = self.m_params["nonlinearity"]["beta"]
         gamma = self.m_params["nonlinearity"]["gamma"]
 
         match self.m_params["nonlinearity"]["type"]:
@@ -359,213 +235,123 @@ class RetinalGanglionCellMosaic(nn.Module):
             case "exp":
                 return lambda x: alpha * torch.exp(beta * (x - gamma))
             case "ppc":
-                return lambda x: x**alpha / (beta * x + 1)
+                return lambda x: x ** alpha / (beta * x + 1)
             case _:
                 return lambda x: x
 
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
     def forward(self, x):
         """
-        Forward pass for the RGC Mosaic using chunked vectorization.
-
         Args:
-            x (np.ndarray or torch.Tensor): The input video stimulus (T, H, W).
-
+            x: (B, T, H, W)
         Returns:
-            torch.Tensor: The output firing rate for each RGC (N_cells, T_windows).
+            linear:      (N_cells, B)
+            firing_rate: (N_cells, B)
         """
-        
-        # Ensure input is a tensor on the correct device
         if isinstance(x, np.ndarray):
             x = torch.as_tensor(x, dtype=torch.float32)
-        x = x.to(self.w.device).float()
-
-        # Reshape input to (N_windows, Win_size, H, W)
-        win_size = len(self.temporal_filter_tensor)
-        x_win = x.unfold(0, win_size, 1).permute(0, 3, 1, 2)
+        x = x.to(self.w_conv.device).float()
         
-        n_windows, _, H, W = x_win.shape
-        rf_diam = self.rf_diam
+        # Spatial padding
+        x_padded = f.pad(x, (self.rf_diam, self.rf_diam, self.rf_diam, self.rf_diam), mode="constant", value=0)
         
-        # Pad the entire windowed video sequence once to handle boundary RFs.
-        # Padding with zero (representing darkness) matches the original logic.
-        # F.pad order: (left, right, top, bottom)
-        x_win_padded = f.pad(x_win, (rf_diam, rf_diam, rf_diam, rf_diam), mode='constant', value=0)
+        # Compute spatiotemporal filter response at every location
+        response_map = f.conv2d(x_padded, self.w_conv, padding=self.rf_diam//2)
+        # response_map: (B, T-15, H, W)
         
-        # Flatten the spatial dimensions of the padded frames for gathering
-        # Shape: (N_windows, Win_size, Padded_Pixels)
-        x_win_flat = x_win_padded.reshape(n_windows, win_size, -1)
+        # Sample mosaic locations
+        response = response_map[:, :, self.cell_y, self.cell_x]  # (B, T-15, N_cells)
         
-        # Determine minibatch sizes (using defaults if not provided)
-        t_batch_size = self.temporal_batch_size if self.temporal_batch_size else n_windows
-        c_batch_size = self.cell_minibatch_size if self.cell_minibatch_size else self.n_cells
-
-        # Accumulate chunked responses with out-of-place concatenation so this
-        # path is compatible with torch.vmap / batched inference.
-        cell_chunks = []
-
-        # Vectorized hierarchical batching
-        for c_start in range(0, self.n_cells, c_batch_size):
-            c_end = min(c_start + c_batch_size, self.n_cells)
-
-            # Extract indices for this minibatch: (C_chunk, RF_Pixels)
-            indices = self.rf_indices_tensor[c_start:c_end]
-
-            time_chunks = []
-            for t_start in range(0, n_windows, t_batch_size):
-                t_end = min(t_start + t_batch_size, n_windows)
-
-                # Select frame chunk: (T_chunk, Win_size, Padded_Pixels)
-                x_chunk = x_win_flat[t_start:t_end]
-
-                # Shape: (T_chunk, Win_size, C_chunk, RF_Pixels)
-                patches = x_chunk[:, :, indices]
-
-                # Reshape to (T_chunk, C_chunk, Win_size * RF_Pixels)
-                patches = patches.permute(0, 2, 1, 3).reshape(t_end - t_start, c_end - c_start, -1)
-
-                # Matrix multiplication with shared filter w: (T_chunk, C_chunk)
-                time_chunks.append((patches @ self.w).T)
-
-            cell_chunks.append(torch.cat(time_chunks, dim=1))
-
-        linear = torch.cat(cell_chunks, dim=0)
-
-        # Apply activation and cap firing rate
+        # Apply 1D conv across temporal dimension (learnable sliding window)
+        # Reshape to (B*N_cells, T-15, 1) for conv1d
+        B, T_out, N_cells = response.shape
+        response_seq = response.permute(0, 2, 1).reshape(B*N_cells, 1, T_out)
+        
+        # Conv1d with kernel_size=16 -> output length = T_out - 16 + 1
+        temporal_response = self.temporal_conv(response_seq)  # (B*N_cells, 1, T_out-15)
+        
+        # Reshape back and aggregate across time
+        temporal_response = temporal_response.squeeze(1).view(B, N_cells, -1)
+        linear = temporal_response.mean(dim=-1).T  # (N_cells, B)
+        
         nonlinear = self.nonlinearity(linear)
         firing_rate = torch.clamp(nonlinear, max=float(self.m_params["max_firing_rate"]))
-
+        
         return linear, firing_rate
 
     def spikes(self, firing_rate):
-        """
-        Generate spikes and spike times from the firing rate.
-
-        Args:
-            firing_rate (torch.Tensor): The computed firing rate (N_cells, T).
-
-        Returns:
-            tuple: (spike_times, spike_counts)
-        """
-
-        dt = 1.0 / self.v_params["frame_rate"]
-        
-        # Rate-based Poisson count: (N_cells, T)
+        dt           = 1.0 / self.v_params["frame_rate"]
         spike_counts = torch.poisson(firing_rate * dt).to(torch.uint16)
-        
-        # For spike times, we follow the original logic (list of arrays)
-        # This is kept as NumPy/CPU for compatibility with list-based irregular data
-        counts_np = spike_counts.cpu().numpy()
+        counts_np    = spike_counts.cpu().numpy()
+
         all_spike_times = []
-        
         for cell_idx in range(counts_np.shape[0]):
-            counts = counts_np[cell_idx]
+            counts     = counts_np[cell_idx]
             cell_times = []
             for bin_idx, k in enumerate(counts):
                 if k > 0:
                     start_t, end_t = bin_idx * dt, (bin_idx + 1) * dt
-                    times = np.random.uniform(start_t, end_t, int(k))
-                    cell_times.extend(times)
+                    cell_times.extend(np.random.uniform(start_t, end_t, int(k)))
             all_spike_times.append(np.sort(np.array(cell_times, dtype=np.float32)))
 
         return all_spike_times, spike_counts
 
+
 class SmoothMonostratifiedCellMosaic(RetinalGanglionCellMosaic):
     """LN-LN encoding model of smooth monostratified (SM) ganglion cells.
-    
-    Based on Rhoades et al. 2019, "Unusual Physiological Properties of 
-    Smooth Monostratified Ganglion Cell Types in Primate Retina."
 
-    SM cells differ from standard parasol/midget RGCs in that their receptive
-    fields contain multiple spatially-segregated nonlinear subunits ("hotspots").
-    Each subunit applies its own spatiotemporal filter and nonlinearity before
-    summation, producing an LN-LN architecture:
-
-        stimulus → [subunit_i: spatial → temporal → nonlinearity] * N → sum → output nonlinearity → rate
+    Based on Rhoades et al. 2019. Each subunit applies its own spatiotemporal
+    filter and nonlinearity before summation into the output nonlinearity.
     """
 
-    def __init__(self, model_parameters: dict, video_parameters: dict, 
-                 cell_minibatch_size: int = None, temporal_batch_size: int = None):
-        """
-        Initialize the SM Cell Mosaic model.
-
-        Args:
-            model_parameters (dict): Parameters including hotspot spatial config,
-                per-subunit temporal filters, tiling, and dual nonlinearities.
-            video_parameters (dict): Video properties (frame_rate, frame_shape).
-            cell_minibatch_size (int, optional): Cells per vectorized batch.
-            temporal_batch_size (int, optional): Temporal windows per vectorized batch.
-        """
-
+    def __init__(
+        self,
+        model_parameters: dict,
+        video_parameters: dict,
+        cell_minibatch_size: int = None,
+    ):
         self.n_subunits = model_parameters["n_subunits"]
-
-        # Initialize the parent — this calls _spatial_filter(), _temporal_filter(),
-        # _spatiotemporal_filter(), _tile_cells(), _calculate_vectorized_indices(),
-        # and _nonlinearity() via super().__init__().
-        # We override the filter methods below so the parent builds our subunit filters.
         super().__init__(
-            model_parameters, video_parameters,
-            cell_minibatch_size=cell_minibatch_size,
-            temporal_batch_size=temporal_batch_size
+            model_parameters,
+            video_parameters
         )
 
-        # The parent registered self.w as the entire spatiotemporal_filter flattened
-        # into a single vector, which is incorrect for the subunit model. We need
-        # separate per-subunit weight buffers for the LN-LN forward pass.
-        del self.w
         for i in range(self.n_subunits):
-            self.register_buffer(
-                f"w_sub_{i}", 
-                self.spatiotemporal_filter[i].reshape(-1)
-            )
+            self.register_buffer(f"w_sub_{i}", self.spatiotemporal_filter[i].reshape(-1))
 
-        # Build the subunit nonlinearity (distinct from the output nonlinearity
-        # which was built by the parent's _nonlinearity() call)
         self.subunit_nonlinearity = self._subunit_nonlinearity()
 
+    # ------------------------------------------------------------------
+    # Filter construction (overrides)
+    # ------------------------------------------------------------------
+
     def _spatial_filter(self):
-        """
-        Compute the multi-hotspot spatial receptive field for SM cells.
-        
-        Generates n_hotspots Gaussian hotspots arranged on a noisy ring,
-        then consolidates them into n_subunits groups. Uses fixed seeds
-        (torch.manual_seed(42), np.random.seed(43)) for deterministic,
-        identical RFs across all cells in the mosaic.
-
-        Returns:
-            torch.Tensor: Subunit spatial filters of shape (n_subunits, H, W).
-        """
-
-        w = self.m_params["spatial"]["width"]
-        h = self.m_params["spatial"]["height"]
-        n_hotspots = self.m_params["n_hotspots"]
+        w           = self.m_params["spatial"]["width"]
+        h           = self.m_params["spatial"]["height"]
+        n_hotspots  = self.m_params["n_hotspots"]
         ring_radius = self.m_params["spatial"]["hotspot_ring_radius"]
-        sigma = self.m_params["spatial"]["hotspot_sigma"]
-        jitter = self.m_params["spatial"]["hotspot_jitter"]
-        grouping = self.m_params["hotspot_grouping"]
+        sigma       = self.m_params["spatial"]["hotspot_sigma"]
+        jitter      = self.m_params["spatial"]["hotspot_jitter"]
+        grouping    = self.m_params["hotspot_grouping"]
 
-        # Fix seeds for deterministic, identical hotspot patterns
         torch.manual_seed(42)
         np.random.seed(43)
 
         def SM_gaussian_2d(w, h, sigma, ring_radius, jitter):
-            """Generate a single Gaussian hotspot at a noisy position on a ring."""
-            theta_random = np.random.uniform(0, 2 * np.pi, 1)
-            cy = (h / 2) + (ring_radius * np.sin(theta_random)) + np.random.normal(0, jitter, 1)
-            cx = (w / 2) + (ring_radius * np.cos(theta_random)) + np.random.normal(0, jitter, 1)
-            y = torch.arange(h, dtype=torch.float32)
-            x = torch.arange(w, dtype=torch.float32)
-            yy, xx = torch.meshgrid(y, x, indexing='ij')
-            return torch.exp(-((xx - cx)**2 + (yy - cy)**2) / (2 * sigma**2))
+            theta = np.random.uniform(0, 2 * np.pi)
+            cy    = (h / 2) + ring_radius * np.sin(theta) + np.random.normal(0, jitter)
+            cx    = (w / 2) + ring_radius * np.cos(theta) + np.random.normal(0, jitter)
+            y     = torch.arange(h, dtype=torch.float32)
+            x     = torch.arange(w, dtype=torch.float32)
+            yy, xx = torch.meshgrid(y, x, indexing="ij")
+            return torch.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sigma ** 2))
 
-        # Generate all hotspots
-        hotspots = torch.zeros(size=(n_hotspots, h, w))
-        for i in range(n_hotspots):
-            hotspots[i] = SM_gaussian_2d(w, h, sigma, ring_radius, jitter)
-
-        # Normalize all hotspots together (as in the user's prototype)
+        hotspots = torch.stack([SM_gaussian_2d(w, h, sigma, ring_radius, jitter) for _ in range(n_hotspots)])
         hotspots = hotspots / torch.sum(hotspots)
 
-        # Consolidate hotspots into subunit groups and normalize each group
         subunit_filters = []
         for group_indices in grouping:
             group_sum = sum(hotspots[i] for i in group_indices)
@@ -574,83 +360,40 @@ class SmoothMonostratifiedCellMosaic(RetinalGanglionCellMosaic):
         return torch.stack(subunit_filters)
 
     def _temporal_filter(self, smooth: bool = True):
-        """
-        Generate per-subunit biphasic temporal filters.
-        
-        Each subunit has its own temporal dynamics read from
-        m_params["temporal"]["subunit_i"], producing distinct
-        spatiotemporal signatures as observed by Rhoades et al.
-
-        Args:
-            smooth (bool): Whether to apply smooth onset window. Defaults to True.
-
-        Returns:
-            torch.Tensor: Per-subunit temporal filters of shape (n_subunits, T_memory).
-        """
-
-        temporal_filters = []
+        filters = []
         for i in range(self.n_subunits):
             t_params = self.m_params["temporal"][f"subunit_{i}"]
+            memory   = int(t_params.get("memory_frames", t_params.get("memory_ms", 16)))
+            dt_ms    = 1000.0 / self.v_params["frame_rate"]
+            t_ms     = torch.arange(memory, dtype=torch.float32) * dt_ms
 
-            memory = int(t_params.get("memory_frames", t_params.get("memory_ms", 16)))
-            dt_ms = 1000. / self.v_params["frame_rate"]
-            t_ms = torch.arange(memory, dtype=torch.float32) * dt_ms
-
-            # Biphasic lobes
             lobe1 = t_params["amp1"] * torch.exp(
-                -((t_ms - t_params["peak1_ms"])**2) / (2 * t_params["width1_ms"]**2)
+                -((t_ms - t_params["peak1_ms"]) ** 2) / (2 * t_params["width1_ms"] ** 2)
             )
             lobe2 = t_params["amp2"] * torch.exp(
-                -((t_ms - t_params["peak2_ms"])**2) / (2 * t_params["width2_ms"]**2)
+                -((t_ms - t_params["peak2_ms"]) ** 2) / (2 * t_params["width2_ms"] ** 2)
             )
 
-            # Smooth onset window
             if smooth:
-                onset_tau_ms = 15.0
-                onset_window = 1.0 - torch.exp(-t_ms / onset_tau_ms)
+                onset_window = 1.0 - torch.exp(-t_ms / 15.0)
                 lobe1 = lobe1 * onset_window
                 lobe2 = lobe2 * onset_window
 
-            # ON/OFF polarity
-            if self.m_params["cell_type"].startswith("OFF"):
-                filt = -lobe1 + lobe2
-            else:
-                filt = lobe1 - lobe2
-
-            temporal_filters.append(torch.flip(filt, dims=[0]))
-
-        return torch.stack(temporal_filters)
-
-    def _spatiotemporal_filter(self):
-        """
-        Combine per-subunit spatial and temporal filters into per-subunit
-        3D spatiotemporal filters.
-
-        Returns:
-            torch.Tensor: Shape (n_subunits, T_memory, H, W).
-        """
-
-        # self.spatial_filter: (n_subunits, H, W)
-        # self.temporal_filter: (n_subunits, T_memory)
-        filters = []
-        for i in range(self.n_subunits):
-            st = self.temporal_filter[i].view(-1, 1, 1) * self.spatial_filter[i].view(1, *self.spatial_filter[i].shape)
-            st = st / torch.norm(st)
-            filters.append(st)
+            filt = (-lobe1 + lobe2) if self.m_params["cell_type"].startswith("OFF") else (lobe1 - lobe2)
+            filters.append(torch.flip(filt, dims=[0]))
 
         return torch.stack(filters)
 
+    def _spatiotemporal_filter(self):
+        filters = []
+        for i in range(self.n_subunits):
+            st = self.temporal_filter[i].view(-1, 1, 1) * self.spatial_filter[i].view(1, *self.spatial_filter[i].shape)
+            filters.append(st / torch.norm(st))
+        return torch.stack(filters)
+
     def _subunit_nonlinearity(self):
-        """
-        Define the nonlinearity applied at each subunit before summation.
-        Read from m_params["subunit_nonlinearity"].
-
-        Returns:
-            func: A lambda function that applies the subunit activation.
-        """
-
         alpha = self.m_params["subunit_nonlinearity"]["alpha"]
-        beta = self.m_params["subunit_nonlinearity"]["beta"]
+        beta  = self.m_params["subunit_nonlinearity"]["beta"]
         gamma = self.m_params["subunit_nonlinearity"]["gamma"]
 
         match self.m_params["subunit_nonlinearity"]["type"]:
@@ -665,108 +408,90 @@ class SmoothMonostratifiedCellMosaic(RetinalGanglionCellMosaic):
             case _:
                 return lambda x: x
 
-    def forward(self, x):
-        """
-        LN-LN forward pass for the SM Cell Mosaic.
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
 
-        For each subunit:
-            1. Extract RF patches from the stimulus
-            2. Apply the subunit's spatiotemporal filter (linear)
-            3. Apply the subunit nonlinearity
-        Then sum across subunits, apply output nonlinearity, and clamp.
+    def forward(self, x):
+        """LN-LN forward pass for the SM cell mosaic.
 
         Args:
-            x (np.ndarray or torch.Tensor): Input video stimulus (T, H, W).
+            x (torch.Tensor): Batched video input of shape (B, T, H, W).
 
         Returns:
-            tuple: (linear_responses, firing_rates), each of shape (N_cells, T_windows).
+            tuple: (linear_responses, firing_rates), each (N_cells, B).
         """
-
-        # Ensure input is a tensor on the correct device
         if isinstance(x, np.ndarray):
             x = torch.as_tensor(x, dtype=torch.float32)
-        # Use the first subunit's weight buffer to determine device
         x = x.to(self.w_sub_0.device).float()
 
-        # All subunits share the same temporal window size (same memory_ms)
-        win_size = self.spatiotemporal_filter.shape[1]
-        x_win = x.unfold(0, win_size, 1).permute(0, 3, 1, 2)
+        B, T, H, W = x.shape
+        rf_diam     = self.rf_diam
 
-        n_windows, _, H, W = x_win.shape
-        rf_diam = self.rf_diam
+        x_padded = f.pad(x, (rf_diam, rf_diam, rf_diam, rf_diam), mode="constant", value=0)
+        x_flat   = x_padded.reshape(B, T, -1)
 
-        # Pad frames for boundary handling
-        x_win_padded = f.pad(x_win, (rf_diam, rf_diam, rf_diam, rf_diam), mode='constant', value=0)
-        x_win_flat = x_win_padded.reshape(n_windows, win_size, -1)
+        c_batch_size = self.cell_minibatch_size or self.n_cells
 
-        # Determine batch sizes
-        t_batch_size = self.temporal_batch_size if self.temporal_batch_size else n_windows
-        c_batch_size = self.cell_minibatch_size if self.cell_minibatch_size else self.n_cells
-
-        # Accumulate the summed subunit responses
-        summed_subunit_response = torch.zeros(
-            (self.n_cells, n_windows), device=x.device, dtype=torch.float32
-        )
-
-        # Process each subunit independently through the LN-LN pipeline
+        subunit_responses = []
         for sub_idx in range(self.n_subunits):
-            # Get this subunit's flattened spatiotemporal filter
             w_sub = getattr(self, f"w_sub_{sub_idx}")
 
-            # Compute linear response for this subunit across all cells using
-            # out-of-place chunk accumulation, which is compatible with vmap.
-            subunit_chunks = []
-
+            cell_chunks = []
             for c_start in range(0, self.n_cells, c_batch_size):
-                c_end = min(c_start + c_batch_size, self.n_cells)
+                c_end   = min(c_start + c_batch_size, self.n_cells)
                 indices = self.rf_indices_tensor[c_start:c_end]
 
-                time_chunks = []
-                for t_start in range(0, n_windows, t_batch_size):
-                    t_end = min(t_start + t_batch_size, n_windows)
-                    x_chunk = x_win_flat[t_start:t_end]
+                # (B, T, C_chunk, RF_pixels)
+                patches = x_flat[:, :, indices]
 
-                    # (T_chunk, Win_size, C_chunk, RF_Pixels)
-                    patches = x_chunk[:, :, indices]
+                # (B, C_chunk, T * RF_pixels)
+                patches = patches.permute(0, 2, 1, 3).reshape(B, c_end - c_start, -1)
 
-                    # (T_chunk, C_chunk, Win_size * RF_Pixels)
-                    patches = patches.permute(0, 2, 1, 3).reshape(
-                        t_end - t_start, c_end - c_start, -1
-                    )
+                # (C_chunk, B)
+                cell_chunks.append((patches @ w_sub).T)
 
-                    # Dot product with this subunit's filter: (C_chunk, T_chunk)
-                    time_chunks.append((patches @ w_sub).T)
+            subunit_responses.append(self.subunit_nonlinearity(torch.cat(cell_chunks, dim=0)))
 
-                subunit_chunks.append(torch.cat(time_chunks, dim=1))
+        # Sum out-of-place: (N_cells, B)
+        summed      = torch.stack(subunit_responses, dim=0).sum(dim=0)
+        firing_rate = torch.clamp(self.nonlinearity(summed), max=float(self.m_params["max_firing_rate"]))
 
-            subunit_linear = torch.cat(subunit_chunks, dim=0)
+        return summed, firing_rate
 
-            # Apply subunit nonlinearity BEFORE summation (the key LN-LN step)
-            summed_subunit_response = (
-                summed_subunit_response + self.subunit_nonlinearity(subunit_linear)
-            )
-
-        # Apply output nonlinearity and clamp firing rate
-        firing_rate = self.nonlinearity(summed_subunit_response)
-        firing_rate = torch.clamp(firing_rate, max=float(self.m_params["max_firing_rate"]))
-
-        return summed_subunit_response, firing_rate
 
 class UnnamedCellMosaic(nn.Module):
-    """a really simple conv-style model to optimize to see
-    what "new" cell type appears
+    """Simple conv-style model to optimize for a novel cell type.
+
+    Expects batched input of shape (B, T, H, W). Applies 2D convolutions
+    over the spatial dimensions independently per timestep, then pools
+    across time to produce a (N_cells, B) output consistent with the
+    RGC mosaic interface.
     """
 
     def __init__(self):
         super().__init__()
-
         self.conv1 = nn.Conv2d(1, 1, kernel_size=16, stride=16)
-        self.conv2 = nn.Conv2d(1, 1, kernel_size=2, stride=2)
-        self.relu = nn.ReLU()
+        self.conv2 = nn.Conv2d(1, 1, kernel_size=2,  stride=2)
+        self.relu  = nn.ReLU()
+
+    @property
+    def n_cells(self):
+        return 1
 
     def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): (B, T, H, W)
 
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
+        Returns:
+            tuple: (responses, responses), each (N_cells, B).
+        """
+        B, T, H, W = x.shape
 
-        return x
+        x_flat = x.reshape(B * T, 1, H, W)
+        out    = self.relu(self.conv1(x_flat))
+        out    = self.relu(self.conv2(out))
+        out    = out.reshape(B, T, -1).mean(dim=1).T  # (N_cells, B)
+
+        return out, out

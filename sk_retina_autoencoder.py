@@ -18,14 +18,7 @@ class RetinaAutoencoder(nn.Module):
     encoding modules later without changing the decoder wiring.
     """
 
-    def __init__(
-        self,
-        model_parameters: dict,
-        video_parameters: dict,
-        decoder_params: dict | None = None,
-        cell_minibatch_size: int | None = None,
-        temporal_batch_size: int | None = None,
-    ):
+    def __init__(self, model_parameters: dict, video_parameters: dict, decoder_params: dict | None = None):
         super().__init__()
 
         self.model_parameters = dict(model_parameters)
@@ -40,25 +33,11 @@ class RetinaAutoencoder(nn.Module):
                 continue
 
             if "Smooth_Monostratified" in cell_type:
-                self.encoder_modules.append(
-                    SmoothMonostratifiedCellMosaic(
-                        params,
-                        self.video_parameters,
-                        cell_minibatch_size=cell_minibatch_size,
-                        temporal_batch_size=temporal_batch_size,
-                    )
-                )
+                self.encoder_modules.append( SmoothMonostratifiedCellMosaic(params, self.video_parameters) )
             elif "Unnamed" in cell_type:
-                self.encoder_modules.append(UnnamedCellMosaic())
+                self.encoder_modules.append( UnnamedCellMosaic() )
             else:
-                self.encoder_modules.append(
-                    RetinalGanglionCellMosaic(
-                        params,
-                        self.video_parameters,
-                        cell_minibatch_size=cell_minibatch_size,
-                        temporal_batch_size=temporal_batch_size,
-                    )
-                )
+                self.encoder_modules.append( RetinalGanglionCellMosaic(params, self.video_parameters))
 
         self.n_cells_per_mosaic = [module.n_cells for module in self.encoder_modules if not isinstance(module, UnnamedCellMosaic)]
 
