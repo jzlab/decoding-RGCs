@@ -1,0 +1,92 @@
+# Defaults for diffusion_retina_train.py. Command-line options override these values.
+target_image: /home/rotation/Downloads/archive/random_images
+output_dir: diffusion_retina_learn_results_perstep
+params: params.yaml
+diffusion_params: diffusion_params.yaml
+
+# --- Image prior -------------------------------------------------------------
+# image_size must equal the checkpoint's unet.config.sample_size; the trainer
+# raises if it does not.
+model_id: google/ddpm-bedroom-256
+image_size: 256
+# To move to a 64 px prior, set model_id to a DDPM-family UNet2DModel
+# checkpoint with sample_size 64 and then set:
+#   image_size: 64
+#   learned_rf_scale: 0.25
+# See README notes: openai/diffusers-ct_imagenet64 is a *consistency* model
+# (CMStochasticIterativeScheduler, no alphas_cumprod, class-conditional), so it
+# is not a drop-in for the DDIM sampler this trainer uses.
+
+device: cuda
+batch_size: 4
+num_workers: 4
+seed: 1234
+
+# --- Reverse process and MAP guidance ----------------------------------------
+num_inference_steps: 100
+# Guidance is applied at EVERY reverse step, so guidance_scale now genuinely
+# affects both the trajectory and the training gradient.
+guidance_scale: 0.035
+guidance_normalization: rms
+rate_noise_std: 1.0
+
+# --- Training scheme ---------------------------------------------------------
+# per_step_map : guide every reverse step and update the learned mosaic at each
+#                one, supervised by whether that step's correction moved the
+#                clean-image estimate toward the target.
+# random_step  : legacy. No guidance at all; rate mismatch at n random steps.
+# final_stage  : legacy. Guidance only in the last differentiable_steps updates.
+train_mode: per_step_map
+map_update_every: 1
+# Weights each step's image loss by alpha_prev, keeping early noisy steps from
+# dominating through the 1/sqrt(alpha_prev) factor in the corrected estimate.
+step_loss_weighting: alpha_prev
+# Legacy-only knobs, retained so the earlier runs reproduce.
+n_gradient_steps: 10
+# differentiable_steps: 1
+
+# --- Learned cell type -------------------------------------------------------
+include_cell_types:
+  - ON_Parasol
+  - OFF_Parasol
+  - ON_Midget
+  - OFF_Midget
+learn_cell_type: ON_Smooth_Monostratified
+learned_n_cells: null
+learned_init_seed: 1234
+# zero_mean_unit_norm admits centre-surround opponency, matching the convention
+# the fixed DoG types use. nonnegative_sum1 is the old family, which forces
+# every subunit to be a positive weighted average and so can only report local
+# mean luminance.
+kernel_parameterization: zero_mean_unit_norm
+# A plain mean over mosaics would give the new type only 1/5 of the likelihood.
+learned_weight: 1.0
+# Scale the learned cell type's spatial lengths only; the fixed types are left
+# at their configured sizes. Use 0.25 alongside image_size 64.
+learned_rf_scale: 1.0
+# Leave null to use the nonlinearities configured in params.yaml.
+learned_subunit_nonlinearity: null
+learned_output_nonlinearity: null
+
+# --- Optimizer and task constraints ------------------------------------------
+# 100 updates per trajectory x 18 batches x 100 epochs = 180,000 parameter
+# updates, against 1,800 for an entire 100-epoch single-update run. Measured
+# at ~1.19 s/step on the RTX 6000 Ada, this is ~59 h.
+epochs: 100
+# There are now num_inference_steps updates per trajectory rather than one, so
+# this is deliberately lower than the 1e-4 used by the single-update runs.
+learning_rate: 0.00002
+weight_decay: 0.0
+grad_clip_norm: 1.0
+# Now non-zero: the diversity term is meaningful once kernels can be signed,
+# and the rate budget is what discourages a trivially quiet cell.
+rf_smoothness_weight: 0.001
+rate_budget_weight: 0.000001
+diversity_weight: 0.001
+# RF snapshots and full checkpoints both land every 5 epochs, giving 20
+# evenly spaced views of how the learned kernels evolve.
+output_every_epochs: 5
+weight_save_every_epochs: 5
+mixed_precision: false
+# Second-order gradients through attention require the math SDP kernel.
+force_math_sdp: true
