@@ -31,11 +31,16 @@ guidance_normalization: rms
 rate_noise_std: 1.0
 
 # --- Training scheme ---------------------------------------------------------
-# per_step_map : guide every reverse step and update the learned mosaic at each
-#                one, supervised by whether that step's correction moved the
-#                clean-image estimate toward the target.
-# random_step  : legacy. No guidance at all; rate mismatch at n random steps.
-# final_stage  : legacy. Guidance only in the last differentiable_steps updates.
+# per_step_map  : guide every reverse step and update the learned mosaic at each
+#                 one, supervised by whether that step's correction moved the
+#                 clean-image estimate toward the target.
+# end_to_end_mse: guide every reverse step, chain the last differentiable_steps
+#                 corrections into one graph, and take a single update per
+#                 trajectory on the completed reconstruction's MSE.  Drops
+#                 per_step_map's fixed-epsilon approximation; requires
+#                 differentiable_steps (uncomment it below).
+# random_step   : legacy. No guidance at all; rate mismatch at n random steps.
+# final_stage   : legacy. Guidance only in the last differentiable_steps updates.
 train_mode: per_step_map
 map_update_every: 1
 # Weights each step's image loss by alpha_prev, keeping early noisy steps from

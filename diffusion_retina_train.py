@@ -8,6 +8,13 @@ supervision is image distance: whether that step's correction moved the
 clean-image estimate toward the target.  The learned type is therefore
 optimized for being *informative*, not for matching its own measurements.
 
+``end_to_end_mse`` is the same supervision read at the end rather than at
+each step: guidance is applied throughout, the last ``differentiable_steps``
+corrections are chained into one graph, and a single update per trajectory is
+taken on the *completed* reconstruction's MSE.  It removes ``per_step_map``'s
+fixed-epsilon one-step-lookahead approximation at the cost of one update per
+trajectory instead of ``num_inference_steps``.
+
 Two single-update-per-trajectory modes are retained for reproducibility:
 ``final_stage`` guides only the last ``differentiable_steps`` updates, and
 ``random_step`` applies no guidance at all and scores rate mismatch at
@@ -480,6 +487,12 @@ def reconstruct_with_per_step_map_updates(unet: UNet2DModel, scheduler: DDPMSche
     alphas = scheduler.alphas_cumprod.to(device)
 
     image_losses: list[float] = []
+    weighted_image_losses: list[float] = []
+    smoothness_terms: list[float] = []
+    diversity_terms: list[float] = []
+    rate_budget_terms: list[float] = []
+    totals: list[float] = []
+    grad_norms: list[float] = []
     rate_losses: list[float] = []
 
     for index, timestep in enumerate(timesteps):
@@ -510,30 +523,138 @@ def reconstruct_with_per_step_map_updates(unet: UNet2DModel, scheduler: DDPMSche
             image_loss = (ddpm_rgb_to_grayscale(corrected_x0) - target).square().mean()
             smoothness, diversity = likelihood.learned_encoder.regularization()
             mean_rate = observed[-1].mean()
-            total = (
-                step_loss_weight(alpha_prev, weighting) * image_loss
-                + regularization["smoothness"] * smoothness
-                + regularization["diversity"] * diversity
-                + regularization["rate_budget"] * mean_rate.square()
-            )
+            # Every term is recorded separately: the weighted image loss is what
+            # the optimizer actually minimizes, while the unweighted one is
+            # comparable across timesteps.  Logging only the latter, as an
+            # earlier version did, hides both the schedule weighting and the
+            # regularizers' share of the gradient.
+            weighted_image_loss = step_loss_weight(alpha_prev, weighting) * image_loss
+            smoothness_term = regularization["smoothness"] * smoothness
+            diversity_term = regularization["diversity"] * diversity
+            rate_budget_term = regularization["rate_budget"] * mean_rate.square()
+            total = weighted_image_loss + smoothness_term + diversity_term + rate_budget_term
             optimizer.zero_grad(set_to_none=True)
             total.backward()
-            if grad_clip_norm and grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(likelihood.learned_encoder.parameters(), grad_clip_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                likelihood.learned_encoder.parameters(),
+                grad_clip_norm if grad_clip_norm and grad_clip_norm > 0 else float("inf"),
+            )
             optimizer.step()
             image_losses.append(float(image_loss.detach()))
+            weighted_image_losses.append(float(weighted_image_loss.detach()))
+            smoothness_terms.append(float(smoothness_term.detach()))
+            diversity_terms.append(float(diversity_term.detach()))
+            rate_budget_terms.append(float(rate_budget_term.detach()))
+            totals.append(float(total.detach()))
+            grad_norms.append(float(grad_norm))
 
         rate_losses.append(float(rate_loss.detach()))
         sample = next_sample.detach()
 
     reconstruction = ddpm_rgb_to_grayscale(sample)
     final_mse = float((reconstruction - target).square().mean())
+
+    def mean(values: list[float]) -> float:
+        """Average a per-step metric over the steps that produced updates.
+
+        Args:
+            values: One entry per training step in this trajectory.
+
+        Returns:
+            Arithmetic mean, or 0.0 when no update was taken.
+        """
+        return sum(values) / len(values) if values else 0.0
+
     return {
         "reconstruction": reconstruction,
-        "step_image_loss": sum(image_losses) / max(len(image_losses), 1),
-        "rate_loss": sum(rate_losses) / max(len(rate_losses), 1),
+        # final_mse is the quantity of interest: the completed reconstruction.
         "final_mse": final_mse,
+        # total is what the optimizer minimizes; step_image_loss is its
+        # unweighted image component, comparable across timesteps.
+        "total": mean(totals),
+        "weighted_image_loss": mean(weighted_image_losses),
+        "step_image_loss": mean(image_losses),
+        "smoothness_term": mean(smoothness_terms),
+        "diversity_term": mean(diversity_terms),
+        "rate_budget_term": mean(rate_budget_terms),
+        "grad_norm": mean(grad_norms),
+        "rate_loss": mean(rate_losses),
         "n_updates": len(image_losses),
+    }
+
+
+def reconstruct_with_end_to_end_mse(unet: UNet2DModel, scheduler: DDPMScheduler, likelihood: FrozenAndLearnedRateLikelihood, target: torch.Tensor, guidance_scale: float, guidance_normalization: str, differentiable_steps: int, generator: torch.Generator, mixed_precision: bool, force_math_sdp: bool) -> dict:
+    """Reconstruct end to end and score the *final* image, not a per-step proxy.
+
+    Guidance is applied at every reverse step so the trajectory stays
+    conditioned on the observed rates.  The last ``differentiable_steps``
+    updates keep a chained graph, so the gradient of the final reconstruction
+    MSE reaches the learned encoder through several successive corrections
+    rather than through a single step's one-step-lookahead estimate.
+
+    Args:
+        unet: Frozen unconditional RGB denoising U-Net.
+        scheduler: DDPM schedule supplying cumulative alphas.
+        likelihood: Fixed-plus-learned RGC rate likelihood.
+        target: Target grayscale images shaped ``(B, 1, H, W)``.
+        guidance_scale: MAP guidance magnitude applied at every step.
+        guidance_normalization: Either ``none`` or ``rms``.
+        differentiable_steps: Number of final updates retaining a chained graph.
+        generator: Seeded generator for the initial diffusion noise.
+        mixed_precision: Whether to autocast CUDA U-Net computation.
+        force_math_sdp: Use math SDP attention on double-backward steps.
+
+    Returns:
+        Dict with the differentiable final ``mse`` plus detached diagnostics.
+    """
+    if differentiable_steps < 1 or differentiable_steps > len(scheduler.timesteps):
+        raise ValueError("--differentiable-steps must be in [1, num_inference_steps].")
+    device = next(unet.parameters()).device
+    sample_size = unet.config.sample_size
+    sample = torch.randn((target.shape[0], 3, sample_size, sample_size), device=device, generator=generator)
+    timesteps = scheduler.timesteps
+    first_differentiable = len(timesteps) - differentiable_steps
+    rate_losses: list[float] = []
+
+    for index, timestep in enumerate(timesteps):
+        previous = timesteps[index + 1] if index + 1 < len(timesteps) else -1
+
+        if index < first_differentiable:
+            # Prefix: guide the trajectory, but keep no graph back to theta.
+            # The correction still needs d(rate loss)/d(x_t), so this is a
+            # first-order pass rather than a no-grad one.
+            state = sample.detach().requires_grad_(True)
+            prediction = differentiable_unet_prediction(unet, state, timestep, mixed_precision, False)
+            predicted_x0 = predict_original_sample(scheduler, state, prediction, timestep)
+            observed = likelihood.observed_rates(target, attach_learned=False)
+            rate_loss = likelihood.loss(ddpm_rgb_to_grayscale(predicted_x0), observed)
+            (rate_gradient,) = torch.autograd.grad(rate_loss, state)
+            correction = guidance_correction(rate_gradient, guidance_scale, guidance_normalization)
+            sample = (ddim_step(scheduler, state, prediction, timestep, previous) - correction).detach()
+            rate_losses.append(float(rate_loss.detach()))
+            continue
+
+        # Tail: chain the graph across steps so one backward reaches theta
+        # through every remaining correction.  Only the first tail step needs
+        # to be made a leaf; later ones are already in the graph.
+        if index == first_differentiable:
+            sample = sample.detach().requires_grad_(True)
+        prediction = differentiable_unet_prediction(unet, sample, timestep, mixed_precision, force_math_sdp)
+        predicted_x0 = predict_original_sample(scheduler, sample, prediction, timestep)
+        observed = likelihood.observed_rates(target, attach_learned=True)
+        rate_loss = likelihood.loss(ddpm_rgb_to_grayscale(predicted_x0), observed)
+        (rate_gradient,) = torch.autograd.grad(rate_loss, sample, create_graph=True)
+        correction = guidance_correction(rate_gradient, guidance_scale, guidance_normalization)
+        sample = ddim_step(scheduler, sample, prediction, timestep, previous) - correction
+        rate_losses.append(float(rate_loss.detach()))
+
+    reconstruction = ddpm_rgb_to_grayscale(sample)
+    mse = (reconstruction - target).square().mean()
+    return {
+        "reconstruction": reconstruction,
+        "mse": mse,
+        "final_mse": float(mse.detach()),
+        "rate_loss": sum(rate_losses) / max(len(rate_losses), 1),
     }
 
 
@@ -651,8 +772,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mixed-precision", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--force-math-sdp", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--n-gradient-steps", type=int, default=None)
-    parser.add_argument("--train-mode", choices=("per_step_map", "random_step", "final_stage"), default=None,
-                        help="per_step_map guides every reverse step and updates the learned mosaic at each one.")
+    parser.add_argument("--train-mode", choices=("per_step_map", "end_to_end_mse", "random_step", "final_stage"), default=None,
+                        help="per_step_map guides every reverse step and updates the learned mosaic at each one; "
+                             "end_to_end_mse takes one update per trajectory on the completed reconstruction.")
     parser.add_argument("--map-update-every", type=int, default=None,
                         help="Take a learned-mosaic update every n-th guided reverse step.")
     parser.add_argument("--step-loss-weighting", choices=("uniform", "alpha_prev", "snr"), default=None)
@@ -684,6 +806,10 @@ def parse_args() -> argparse.Namespace:
     missing = [name for name in required if getattr(args, name, None) is None]
     if missing:
         parser.error(f"Missing required settings (CLI or {args.config}): {', '.join(missing)}")
+    # Both graph-chaining modes need a tail length; per_step_map and
+    # random_step do not, so this is checked per mode rather than in `required`.
+    if args.train_mode in ("end_to_end_mse", "final_stage") and args.differentiable_steps is None:
+        parser.error(f"--differentiable-steps is required for --train-mode {args.train_mode}.")
     return args
 
 def main() -> None:
@@ -769,8 +895,12 @@ def main() -> None:
     print(f"Training mode: {args.train_mode} (update every {args.map_update_every} guided step(s)).")
 
     # Optimize only the extra RGC mosaic against guided-reconstruction quality.
+    # Accumulate every reported term, not just the image component.
+    per_step_keys = ("total", "weighted_image_loss", "step_image_loss",
+                     "smoothness_term", "diversity_term", "rate_budget_term", "grad_norm")
     for epoch in range(1, total_epochs + 1):
         epoch_mse = epoch_rate = epoch_total = 0.0
+        epoch_terms = dict.fromkeys(per_step_keys, 0.0)
         save_weights = epoch % weight_save_every_epochs == 0 or epoch == total_epochs
         progress.set_postfix(epoch=f"{epoch}/{total_epochs}")
         for target in loader:
@@ -788,7 +918,33 @@ def main() -> None:
                 reconstruction = stats["reconstruction"]
                 epoch_mse += stats["final_mse"]
                 epoch_rate += stats["rate_loss"]
-                epoch_total += stats["step_image_loss"]
+                epoch_total += stats["total"]
+                for key in per_step_keys:
+                    epoch_terms[key] += stats[key]
+            elif args.train_mode == "end_to_end_mse":
+                # Guidance throughout, one update per trajectory, supervised by
+                # the completed reconstruction rather than a per-step estimate.
+                stats = reconstruct_with_end_to_end_mse(
+                    unet, scheduler, likelihood, target, args.guidance_scale,
+                    args.guidance_normalization, int(args.differentiable_steps),
+                    generator, bool(args.mixed_precision), bool(args.force_math_sdp),
+                )
+                reconstruction = stats["reconstruction"].detach()
+                smoothness, diversity = learned_encoder.regularization()
+                # Recomputed here because the trajectory's own measurement graph
+                # is consumed by the backward below.
+                mean_rate = likelihood.observed_rates(target)[-1].mean()
+                total = (stats["mse"] + regularization["smoothness"] * smoothness
+                         + regularization["diversity"] * diversity
+                         + regularization["rate_budget"] * mean_rate.square())
+                optimizer.zero_grad(set_to_none=True)
+                total.backward()
+                if args.grad_clip_norm and args.grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(learned_encoder.parameters(), args.grad_clip_norm)
+                optimizer.step()
+                epoch_mse += stats["final_mse"]
+                epoch_rate += stats["rate_loss"]
+                epoch_total += float(total.detach())
             else:
                 # Legacy single-update-per-trajectory paths, retained so the
                 # earlier runs stay reproducible.
@@ -825,6 +981,8 @@ def main() -> None:
         # Calculate metrics every epoch, but write artifacts only at the requested interval.
         n_batches = len(loader)
         metrics = {"epoch": epoch, "mse": epoch_mse / n_batches, "rgc_loss": epoch_rate / n_batches, "total_loss": epoch_total / n_batches}
+        if args.train_mode == "per_step_map":
+            metrics.update({key: epoch_terms[key] / n_batches for key in per_step_keys})
         history.append(metrics)
         should_output = epoch % output_every_epochs == 0 or epoch == total_epochs
         if should_output:
@@ -832,8 +990,12 @@ def main() -> None:
             print(json.dumps(metrics))
             state = {"epoch": epoch, "args": vars(args), "learned_encoder_state_dict": learned_encoder.state_dict(), "optimizer_state_dict": optimizer.state_dict(), "history": history}
             torch.save(state, output_dir / "last.pt")
-            if metrics["total_loss"] < best_loss:
-                best_loss = metrics["total_loss"]
+            # Select on the completed reconstruction, which is the quantity of
+            # interest, rather than on a per-step training proxy.
+            image_supervised = args.train_mode in ("per_step_map", "end_to_end_mse")
+            selection_metric = metrics["mse"] if image_supervised else metrics["total_loss"]
+            if selection_metric < best_loss:
+                best_loss = selection_metric
                 torch.save(state, output_dir / "best.pt")
             save_preview(target, output_dir / f"target_epoch_{epoch:04d}.png")
             save_preview(reconstruction, output_dir / f"reconstruction_epoch_{epoch:04d}.png")
