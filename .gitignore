@@ -1,4 +1,5 @@
-/__pycache__
+__pycache__/
+*.py[cod]
 **/*.pt
 **/*.h5
 **/*reconstructed*
@@ -11,3 +12,34 @@ notes.txt
 
 /frame_features*.csv
 /random_sk.py
+
+# ---------------------------------------------------------------- experiment output
+# Result directories hold gigabytes of arrays and rendered images. Ignore their
+# contents, but keep the notebooks, reports and run scripts that live alongside:
+# under the project convention the analysis and its figures live in the .ipynb, so
+# those must stay tracked. Re-including `**/` lets git descend into subdirectories
+# to find them (it never tracks a directory itself, only files).
+/results_prior-vs-likelihood/**
+!/results_prior-vs-likelihood/**/
+!/results_prior-vs-likelihood/**/*.ipynb
+!/results_prior-vs-likelihood/**/*.md
+!/results_prior-vs-likelihood/**/*.sh
+
+/diffusion_retina_learn_results*/**
+!/diffusion_retina_learn_results*/**/
+!/diffusion_retina_learn_results*/**/*.ipynb
+!/diffusion_retina_learn_results*/**/*.md
+!/diffusion_retina_learn_results*/**/*.sh
+
+/hyperparameter_search_*/**
+!/hyperparameter_search_*/**/
+!/hyperparameter_search_*/**/*.ipynb
+!/hyperparameter_search_*/**/*.md
+!/hyperparameter_search_*/**/*.sh
+
+# Loose run artifacts
+*.log
+random_test.png
+
+# Editor
+/.vscode
