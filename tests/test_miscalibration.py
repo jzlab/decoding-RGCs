@@ -24,7 +24,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-import analysis.spectral_fillin as sf
+import diffusion.analysis.spectral_fillin as sf
 import toy
 
 SHAPE = (64, 64)

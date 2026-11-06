@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-import analysis.spectral_fillin as sf
+import diffusion.analysis.spectral_fillin as sf
 
 SHAPES = [(64, 64), (63, 64), (64, 63), (63, 65), (32, 48)]
 WINDOWS = [("none", 0.0), ("hann", 0.0), ("tukey", 0.25), ("tukey", 0.5), ("tukey", 1.0)]

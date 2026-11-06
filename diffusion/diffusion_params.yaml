@@ -1,0 +1,25 @@
+# Separate configuration for the static diffusion-MAP reconstruction path.
+model_id: google/ddpm-bedroom-256
+image_size: 256
+num_inference_steps: 250
+guidance_scale: 0.25
+guidance_normalization: rms
+# Gaussian-surrogate standard deviation for deterministic firing rates.
+rate_noise_std: 1.0
+# Optional ablation list. Omit this key to include every configured cell type.
+include_cell_types:
+  - ON_Parasol
+  - OFF_Parasol
+  - ON_Midget
+  - OFF_Midget
+#   - ON_Smooth_Monostratified
+
+# ------------------------------------------------------------------ backbone
+# Which unconditional prior to guide:
+#   diffusers : the model_id above, loaded through Diffusers (default, unchanged)
+#   dps       : the ADM/guided-diffusion network published with Diffusion
+#               Posterior Sampling, loaded from a local checkpoint
+# Overridable per run with --backbone / --dps-checkpoint / --dps-preset.
+backbone: diffusers
+dps_checkpoint: diffusion/models/imagenet256.pt
+dps_preset: imagenet256
