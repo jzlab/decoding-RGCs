@@ -1,13 +1,57 @@
-/__pycache__
+__pycache__/
+*.py[cod]
+# Model weights and cached activations. Each pipeline keeps its own under
+# <package>/models/; these patterns ignore the artifacts in any format and at any
+# depth, while the .gitkeep files below keep the directories themselves in the
+# tree so the layout is visible on a fresh clone.
 **/*.pt
+**/*.pth
 **/*.h5
+**/*.ckpt
+**/*.safetensors
+**/*.bin
+!**/models/.gitkeep
 **/*reconstructed*
 notes.txt
 
-/testing_videos
-/lnp_activations_bank*
-/full_video_activations
-/reconstructions
+# Bulk data directories. Matched at any depth rather than only at the repository
+# root, so moving one into a pipeline package does not silently un-ignore it.
+**/testing_videos/
+**/lnp_activations_bank*/
+**/lnp_naturalmovies/
+**/full_video_activations/
+**/reconstructions/
 
 /frame_features*.csv
 /random_sk.py
+
+# ---------------------------------------------------------------- experiment output
+# Result directories hold gigabytes of arrays and rendered images. Ignore their
+# contents, but keep the notebooks, reports and run scripts that live alongside:
+# under the project convention the analysis and its figures live in the .ipynb, so
+# those must stay tracked. Re-including `**/` lets git descend into subdirectories
+# to find them (it never tracks a directory itself, only files).
+/results_prior-vs-likelihood/**
+!/results_prior-vs-likelihood/**/
+!/results_prior-vs-likelihood/**/*.ipynb
+!/results_prior-vs-likelihood/**/*.md
+!/results_prior-vs-likelihood/**/*.sh
+
+/diffusion_retina_learn_results*/**
+!/diffusion_retina_learn_results*/**/
+!/diffusion_retina_learn_results*/**/*.ipynb
+!/diffusion_retina_learn_results*/**/*.md
+!/diffusion_retina_learn_results*/**/*.sh
+
+/hyperparameter_search_*/**
+!/hyperparameter_search_*/**/
+!/hyperparameter_search_*/**/*.ipynb
+!/hyperparameter_search_*/**/*.md
+!/hyperparameter_search_*/**/*.sh
+
+# Loose run artifacts
+*.log
+random_test.png
+
+# Editor
+/.vscode

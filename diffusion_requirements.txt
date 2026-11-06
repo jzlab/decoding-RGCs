@@ -1,0 +1,4 @@
+# Dependencies specific to the separate diffusion-MAP workflow.
+diffusers>=0.30
+safetensors>=0.4
+accelerate>=0.30

@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as f
 
-from sk_utils import Utils as u
+from shared.sk_utils import Utils as u
 from skimage.transform import resize
 
 class Retina(nn.Module):

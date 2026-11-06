@@ -1,3 +1,12 @@
+# Running this file directly puts its own folder on sys.path, not the repository
+# root, so the shared package would not resolve. Prepend the root before any
+# first-party import. Harmless when the module is imported as part of a package.
+import sys as _sys
+from pathlib import Path as _Path
+
+_REPO_ROOT = str(_Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
 import os
 import argparse
 import numpy as np
@@ -7,9 +16,9 @@ import subprocess
 import h5py
 from tqdm import tqdm
 
-from sk_utils import Utils as u
-from sk_decoder import RetinaDecoder
-from sk_generate_activations import setup_retina, crop_video
+from shared.sk_utils import Utils as u
+from autoencoder.sk_decoder import RetinaDecoder
+from autoencoder.sk_generate_activations import setup_retina, crop_video
 
 def setup_decoder(params, training_params, n_cells_per_mosaic, device="cpu", weights_path=None):
     print("Initializing Decoder model...")
@@ -73,11 +82,11 @@ def pad_dimensions(H, W, patch_h, patch_w):
 def main():
     parser = argparse.ArgumentParser(description="Reconstruct full video by chunking")
     parser.add_argument("--video", type=str, required=True, help="Path to input video")
-    parser.add_argument("--params", type=str, default="params.yaml")
-    parser.add_argument("--training-params", type=str, default="params_training.yaml")
+    parser.add_argument("--params", type=str, default=f"{_REPO_ROOT}/shared/params.yaml")
+    parser.add_argument("--training-params", type=str, default=f"{_REPO_ROOT}/autoencoder/params_training.yaml")
     parser.add_argument("--weights", type=str, required=True, help="Path to decoder weights (.pt)")
     parser.add_argument("--activations", type=str, default=None, help="Path to pre-generated activations (.pt) to skip Phase 1")
-    parser.add_argument("--output-activations", type=str, default="full_video_activations.pt")
+    parser.add_argument("--output-activations", type=str, default=f"{_REPO_ROOT}/autoencoder/models/full_video_activations.pt")
     parser.add_argument("--output-video", type=str, default="reconstructed.mp4")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--zero-celltype", type=int, nargs="+", default=None, help="Indices of celltypes to zero out before decoding")

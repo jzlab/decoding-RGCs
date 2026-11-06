@@ -1,3 +1,12 @@
+# Running this file directly puts its own folder on sys.path, not the repository
+# root, so the shared package would not resolve. Prepend the root before any
+# first-party import. Harmless when the module is imported as part of a package.
+import sys as _sys
+from pathlib import Path as _Path
+
+_REPO_ROOT = str(_Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
 import os
 import argparse
 import random
@@ -6,8 +15,8 @@ import torch
 import h5py
 import json
 import scipy.ndimage
-from sk_utils import Utils as u
-from sk_retina_encoders import Retina
+from shared.sk_utils import Utils as u
+from shared.sk_retina_encoders import Retina
 
 from tqdm import tqdm
 
@@ -328,7 +337,7 @@ def main():
     )
     parser.add_argument("--video",   type=str, required=True,
                         help="Path to the input video file or directory of videos.")
-    parser.add_argument("--params",  type=str, default="params.yaml",
+    parser.add_argument("--params",  type=str, default=f"{_REPO_ROOT}/shared/params.yaml",
                         help="Path to params.yaml.")
     parser.add_argument("--output",  type=str, required=True,
                         help="Path to save the output activations (.h5) or directory if --video is a directory.")

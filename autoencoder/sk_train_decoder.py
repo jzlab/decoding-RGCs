@@ -1,3 +1,12 @@
+# Running this file directly puts its own folder on sys.path, not the repository
+# root, so the shared package would not resolve. Prepend the root before any
+# first-party import. Harmless when the module is imported as part of a package.
+import sys as _sys
+from pathlib import Path as _Path
+
+_REPO_ROOT = str(_Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
 import os
 import glob
 import yaml
@@ -8,8 +17,8 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from tqdm import tqdm
-from sk_utils import Utils as u
-from sk_decoder import RetinaDecoder
+from shared.sk_utils import Utils as u
+from autoencoder.sk_decoder import RetinaDecoder
 
 class RGCDataset(Dataset):
     """
@@ -282,7 +291,7 @@ def train(args):
 def main():
     parser = argparse.ArgumentParser(description="Train the Decoder model on RGC activations.")
     parser.add_argument("--activations", type=str, required=True, help="Path to the .h5 file or directory containing RGC activations.")
-    parser.add_argument("--params", type=str, default="params.yaml", help="Path to the retina model params.yaml.")
+    parser.add_argument("--params", type=str, default=f"{_REPO_ROOT}/shared/params.yaml", help="Path to the retina model params.yaml.")
     parser.add_argument("--training-params", type=str, default="training_params.yaml", help="Path to training_params.yaml.")
     parser.add_argument("--output", type=str, default="best_decoder.pt", help="Path to save the best model weights.")
     parser.add_argument("--device",      type=str,   help="Device to use (cpu, cuda). Overrides training_params.yaml.")

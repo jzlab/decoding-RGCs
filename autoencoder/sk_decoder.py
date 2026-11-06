@@ -1,3 +1,12 @@
+# Running this file directly puts its own folder on sys.path, not the repository
+# root, so the shared package would not resolve. Prepend the root before any
+# first-party import. Harmless when the module is imported as part of a package.
+import sys as _sys
+from pathlib import Path as _Path
+
+_REPO_ROOT = str(_Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
 import torch
 import torch.nn as nn
 import torch.nn.functional as f
